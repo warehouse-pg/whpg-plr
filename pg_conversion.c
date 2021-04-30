@@ -1804,7 +1804,7 @@ get_generic_array_datum(SEXP rval, plr_function *function, int col, bool *isnull
 				else
 				{
 					nulls[i] = FALSE;
-					dvalues[i] = Float8GetDatum((double) REAL(rval)[i]);
+					dvalues[i] = DirectFunctionCall1(float8_numeric, Float8GetDatum((double)REAL(rval)[i])); 
 				}
 			}
 		}
