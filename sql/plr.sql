@@ -495,3 +495,5 @@ SELECT routfloat4(10);
 SELECT count(rlargeint8out(15000));
 SELECT count(routfloat4(15000));
 
+create or replace function test_return_numeric() returns numeric[] as 'array(1:10,c(2,5))' language 'plr';
+SELECT test_return_numeric();
