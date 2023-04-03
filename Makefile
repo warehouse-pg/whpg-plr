@@ -73,6 +73,9 @@ override CPPFLAGS := -I"$(srcdir)" -I"$(r_includespec)" $(CPPFLAGS)
 override CPPFLAGS += -DPKGLIBDIR=\"$(pkglibdir)\" -DDLSUFFIX=\"$(DLSUFFIX)\"
 override CPPFLAGS += -DR_HOME_DEFAULT=\"$(rhomedef)\"
 
+REGRESS_OPTS = --dbname=$(PL_TESTDB) --print-failure-diffs
+REGRESS_OPTS += --init-file=init_file
+
 else # can't build
 
 all:
