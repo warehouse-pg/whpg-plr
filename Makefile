@@ -71,7 +71,9 @@ ifneq (,$(findstring yes, $(shared_libr)$(allow_nonpic_in_shlib)))
 
 override CPPFLAGS := -I"$(srcdir)" -I"$(r_includespec)" $(CPPFLAGS)
 override CPPFLAGS += -DPKGLIBDIR=\"$(pkglibdir)\" -DDLSUFFIX=\"$(DLSUFFIX)\"
-override CPPFLAGS += -DR_HOME_DEFAULT=\"$(rhomedef)\"
+# WHPG disable this on purpose. R_HOME_DEFAULT will be passed through CMake.
+# To make sure it contains the right value after user installation.
+#override CPPFLAGS += -DR_HOME_DEFAULT=\"$(rhomedef)\"
 
 REGRESS_OPTS = --dbname=$(PL_TESTDB) --print-failure-diffs
 REGRESS_OPTS += --init-file=init_file
