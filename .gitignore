@@ -1,0 +1,5 @@
+results
+whpg/3rdparty
+build
+*.o
+*.so
