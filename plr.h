@@ -371,7 +371,7 @@ extern void R_RunExitFinalizers(void);
 		tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod); \
 		tuple->t_len = HeapTupleHeaderGetDatumLength(tuple_hdr); \
 		ItemPointerSetInvalid(&(tuple->t_self)); \
-		tuple->t_tableOid = InvalidOid; \
+		/* tuple->t_tableOid = InvalidOid; */\
 		tuple->t_data = tuple_hdr; \
 		PROTECT(el = pg_tuple_get_r_frame(1, &tuple, tupdesc)); \
 		ReleaseTupleDesc(tupdesc); \
