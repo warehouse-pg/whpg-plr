@@ -453,7 +453,7 @@ CREATE TABLE test_data (
   fyear integer,
   firm float8,
   eps float8
-);
+) DISTRIBUTED RANDOMLY;
 
 -- insert data for test
 INSERT INTO test_data
