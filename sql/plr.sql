@@ -14,10 +14,6 @@ CREATE TABLE plr_modules (
 	modsrc text
 ) DISTRIBUTED REPLICATED;
 
-CREATE TABLE module_test (i int) DISTRIBUTED BY (i);
-
-INSERT INTO module_test select * from generate_series(1, 10);
-
 CREATE OR REPLACE FUNCTION pg_test_module_load(text) RETURNS TEXT AS
 'pg.test.module.load(arg1)' LANGUAGE plr;
 
@@ -27,11 +23,11 @@ VALUES (0, 'pg.test.module.load <-function(msg) {print(msg)}');
 select reload_plr_modules();
 
 -- force to reload on segment
-select count(reload_plr_modules()) from module_test;
+select reload_plr_modules() from gp_dist_random('gp_id');
 
 select pg_test_module_load('hello world');
 
-select count(pg_test_module_load('hello world')) from module_test;
+select pg_test_module_load('hello world') from gp_dist_random('gp_id');
 
 --
 -- user defined R function test
@@ -306,7 +302,7 @@ if (arg2 < 1 || arg3 < 1 || arg4 < 1)
 if (arg2 > dim(arg1)[1] || arg3 > dim(arg1)[2] || arg4 > dim(arg1)[3])
   return(NA)
 return(arg1[arg2,arg3,arg4])
-' language 'plr' WITH (isstrict);
+' language 'plr' STRICT;
 
 select arr3d('{{{111,112},{121,122},{131,132}},{{211,212},{221,222},{231,232}}}',2,3,1) as "231";
 -- for sake of comparison, see what normal pgsql array operations produces
@@ -321,7 +317,7 @@ select f1[0][1][1] is null as "NULL" from (select '{{{111,112},{121,122},{131,13
 --
 -- test 3D array return value
 --
-create or replace function arr3d(_int4) returns int4[] as 'return(arg1)' language 'plr' WITH (isstrict);
+create or replace function arr3d(_int4) returns int4[] as 'return(arg1)' language 'plr' STRICT;
 select arr3d('{{{111,112},{121,122},{131,132}},{{211,212},{221,222},{231,232}}}');
 
 --Disabled by legacy gp plr 0f80312e8. whpg doesn't support trigger
@@ -417,14 +413,15 @@ select arr3d('{{{111,112},{121,122},{131,132}},{{211,212},{221,222},{231,232}}}'
 --select count(*) from foo;
 --drop trigger footrig on foo;
 
+
+-- Test cursors: creating, scrolling forward, closing
+CREATE OR REPLACE FUNCTION cursor_fetch_test(integer,boolean) RETURNS SETOF integer AS 'plan<-pg.spi.prepare("SELECT * FROM generate_series(1,10)"); cursor<-pg.spi.cursor_open("curs",plan); dat<-pg.spi.cursor_fetch(cursor,arg2,arg1); pg.spi.cursor_close(cursor); return (dat);' language 'plr';
+SELECT * FROM cursor_fetch_test(1,true);
+SELECT * FROM cursor_fetch_test(2,true);
+SELECT * FROM cursor_fetch_test(20,true);
+
 -- Disabled by legacy gp plr 0f80312e8. Since:
 -- "backward scan is not supported in this version of Greenplum Database"
--- Test cursors: creating, scrolling forward, closing
---CREATE OR REPLACE FUNCTION cursor_fetch_test(integer,boolean) RETURNS SETOF integer AS 'plan<-pg.spi.prepare("SELECT * FROM generate_series(1,10)"); cursor<-pg.spi.cursor_open("curs",plan); dat<-pg.spi.cursor_fetch(cursor,arg2,arg1); pg.spi.cursor_close(cursor); return (dat);' language 'plr';
---SELECT * FROM cursor_fetch_test(1,true);
---SELECT * FROM cursor_fetch_test(2,true);
---SELECT * FROM cursor_fetch_test(20,true);
-
 --Test cursors: scrolling backwards
 --CREATE OR REPLACE FUNCTION cursor_direction_test() RETURNS SETOF integer AS'plan<-pg.spi.prepare("SELECT * FROM generate_series(1,10)"); cursor<-pg.spi.cursor_open("curs",plan); dat<-pg.spi.cursor_fetch(cursor,TRUE,as.integer(3)); dat2<-pg.spi.cursor_fetch(cursor,FALSE,as.integer(3)); pg.spi.cursor_close(cursor); return (dat2);' language 'plr';
 --SELECT * FROM cursor_direction_test();
@@ -474,12 +471,14 @@ $BODY$
 $BODY$
 LANGUAGE plr WINDOW;
 
-SELECT *, round((r_regr_slope(eps, lag_eps) OVER w)::numeric,6) AS slope_R
-FROM (SELECT firm, fyear, eps,
-  lag(eps) OVER (ORDER BY firm, fyear) AS lag_eps
-FROM test_data) AS a
-WHERE eps IS NOT NULL
-WINDOW w AS (ORDER BY firm, fyear ROWS 8 PRECEDING);
+-- Disabled from WHPG7, error has been raised in PG12:
+-- WINDOW_SEEK_CURRENT is not supported for WinGetFuncArgInFrame
+-- SELECT *, round((r_regr_slope(eps, lag_eps) OVER w)::numeric,6) AS slope_R
+-- FROM (SELECT firm, fyear, eps,
+--   lag(eps) OVER (ORDER BY firm, fyear) AS lag_eps
+-- FROM test_data) AS a
+-- WHERE eps IS NOT NULL
+-- WINDOW w AS (ORDER BY firm, fyear ROWS 8 PRECEDING);
 
 CREATE OR REPLACE FUNCTION rlargeint8out(n int) RETURNS int8[] AS $$
 matrix(2, 1, n)
