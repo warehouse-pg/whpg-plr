@@ -5,6 +5,7 @@
 mkdir build
 cd build
 cmake ../whpg
+make
 ```
 
 ## Install
