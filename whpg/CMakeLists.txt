@@ -80,10 +80,10 @@ ExternalProject_Add(
     r
 
     URL
-    https://cran.r-project.org/src/base/R-3/R-3.3.3.tar.gz
-    https://mirrors.tuna.tsinghua.edu.cn/CRAN/src/base/R-3/R-3.3.3.tar.gz
+    https://cran.r-project.org/src/base/R-3/R-3.6.3.tar.gz
+    https://mirrors.tuna.tsinghua.edu.cn/CRAN/src/base/R-3/R-3.6.3.tar.gz
     URL_HASH
-    SHA256=5ab768053a275084618fb669b4fbaadcc39158998a87e8465323829590bcfc6c
+    SHA256=89302990d8e8add536e12125ec591d6951022cf8475861b3690bc8bf1cefaa8f
     DOWNLOAD_DIR ${DOWNLOAD_DIR}
 
     # There are many "multiple definition" error with gcc10 and R 3.3.3.
