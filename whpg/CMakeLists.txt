@@ -114,7 +114,7 @@ ExternalProject_Add(
     ${CMAKE_COMMAND} -E make_directory ${INSTALL_DIR}${R_PREFIX}/lib
     COMMAND
     ${CMAKE_COMMAND} -E chdir ${INSTALL_DIR}${R_PREFIX}/lib
-    ln -s ../lib64/R/lib/libR.so ../lib64/R/lib/libRblas.so ../lib64/R/lib/libRlapack.so .
+    ln -s ../lib/R/lib/libR.so ../lib/R/lib/libRblas.so ../lib/R/lib/libRlapack.so .
 )
 
 ExternalProject_Add(
@@ -129,16 +129,16 @@ ExternalProject_Add(
     BUILD_COMMAND
     # Always clean first, the makefile doesn't work well.
     ${CMAKE_COMMAND} -E env
-    "R_HOME=${INSTALL_DIR}${R_PREFIX}/lib64/R"
+    "R_HOME=${INSTALL_DIR}${R_PREFIX}/lib/R"
     make USE_PGXS=1 clean
     COMMAND
     ${CMAKE_COMMAND} -E env
-    "R_HOME=${INSTALL_DIR}${R_PREFIX}/lib64/R"
-    make -j${JOBS} USE_PGXS=1 with_llvm=no CPPFLAGS="-DR_HOME_DEFAULT=\\\"${R_PREFIX}/lib64/R\\\""
+    "R_HOME=${INSTALL_DIR}${R_PREFIX}/lib/R"
+    make -j${JOBS} USE_PGXS=1 with_llvm=no CPPFLAGS="-DR_HOME_DEFAULT=\\\"${R_PREFIX}/lib/R\\\""
 
     INSTALL_COMMAND
     ${CMAKE_COMMAND} -E env
-    "R_HOME=${INSTALL_DIR}${R_PREFIX}/lib64/R"
+    "R_HOME=${INSTALL_DIR}${R_PREFIX}/lib/R"
     make install
     USE_PGXS=1 with_llvm=no DESTDIR=${PLR_TEMP_INSTALL_PREFIX}
 
@@ -148,7 +148,7 @@ ExternalProject_Add(
 add_custom_target(
     installcheck
     ${CMAKE_COMMAND} -E env
-    "R_HOME=${GPHOME_DIR}/lib64/R"
+    "R_HOME=${GPHOME_DIR}/lib/R"
     make installcheck USE_PGXS=1
     WORKING_DIRECTORY ${PLR_SOURCE_DIR}
 )

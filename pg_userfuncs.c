@@ -323,8 +323,8 @@ plr_environ(PG_FUNCTION_ARGS)
 	 */
 	if (tupdesc->natts != 2 ||
 #if GP_VERSION_NUM >= 70000
-		tupdesc->attrs[0].atttypid != TEXTOID ||
-		tupdesc->attrs[1].atttypid != TEXTOID)
+		TupleDescAttr(tupdesc, 0)->atttypid != TEXTOID ||
+		TupleDescAttr(tupdesc, 1)->atttypid != TEXTOID)
 #else
 		tupdesc->attrs[0]->atttypid != TEXTOID ||
 		tupdesc->attrs[1]->atttypid != TEXTOID)
@@ -416,7 +416,6 @@ plr_environ(PG_FUNCTION_ARGS)
 	 */
 	ReleaseTupleDesc(tupdesc);
 
-	tuplestore_donestoring(tupstore);
 	rsinfo->setResult = tupstore;
 
 	/*
