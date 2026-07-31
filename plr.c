@@ -416,6 +416,20 @@ plr_init(void)
 				 errhint("R_HOME must be correct in the environment " \
 						 "of the user that starts the postmaster process.")));
 
+	/*
+	 * R_SignalHandlers=0 above does not stop R from installing its own
+	 * SIGSEGV/SIGILL/SIGBUS handler (R's "call stack on segfault"
+	 * diagnostic feature is unconditional in modern R). That handler can
+	 * intercept a crash that occurs while Postgres is unwinding an error
+	 * inside the postmaster's own signal-safe error path, silently
+	 * "recovering" in a way that leaves Postgres's error machinery
+	 * inconsistent. Explicitly restore default disposition so any such
+	 * crash terminates the backend normally instead.
+	 */
+	signal(SIGSEGV, SIG_DFL);
+	signal(SIGILL, SIG_DFL);
+	signal(SIGBUS, SIG_DFL);
+
 	/* arrange for automatic cleanup at proc_exit */
 	on_proc_exit(plr_cleanup, 0);
 
@@ -1117,7 +1131,7 @@ do_compile(FunctionCallInfo fcinfo,
 			for (i = 0; i < function->result_natts; i++)
 			{
 #if GP_VERSION_NUM >= 70000
-				function->result_fld_elem_typid[i] = get_element_type(tupdesc->attrs[i].atttypid);
+				function->result_fld_elem_typid[i] = get_element_type(TupleDescAttr(tupdesc, i)->atttypid);
 #else
 				function->result_fld_elem_typid[i] = get_element_type(tupdesc->attrs[i]->atttypid);
 #endif

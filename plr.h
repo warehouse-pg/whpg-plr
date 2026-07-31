@@ -71,18 +71,29 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+#include "utils/tuplestore.h"
 #include "utils/typcache.h"
 
 #include <unistd.h>
 #include <fcntl.h>
 #include <setjmp.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 
 /*
  * The R headers define various symbols that are also defined by the
- * Postgres headers, so undef them first to avoid conflicts.
+ * Postgres headers, so undef them first to avoid conflicts. Capture
+ * Postgres's real numeric values first so they can be restored exactly
+ * afterwards - hardcoding them (as this used to do: WARNING=19, ERROR=20)
+ * silently goes stale whenever Postgres inserts a new elevel in between
+ * (e.g. WARNING_CLIENT_ONLY=20 shifted ERROR to 21 in PG18+), causing
+ * every ereport(ERROR, ...) in this file to actually report at whatever
+ * *other* level the stale number now belongs to - reported to the client,
+ * but never throwing.
  */
+enum { PLR_PG_REAL_WARNING = WARNING, PLR_PG_REAL_ERROR = ERROR };
+
 #ifdef ERROR
 #undef ERROR
 #endif
@@ -127,8 +138,8 @@ extern int R_SignalHandlers;
 #undef WARNING
 #endif
 
-#define WARNING		19
-#define ERROR		20
+#define WARNING		PLR_PG_REAL_WARNING
+#define ERROR		PLR_PG_REAL_ERROR
 
 /* starting in R-2.7.0 this defn was removed from Rdevices.h */
 #ifndef KillAllDevices
@@ -474,23 +485,33 @@ extern void R_RunExitFinalizers(void);
 			pfree(argnames); \
 	} while (0)
 #define PREPARE_PG_TRY \
-	ERRORCONTEXTCALLBACK
+	ERRORCONTEXTCALLBACK; \
+	ErrorData  *plr_caught_edata = NULL
 #define SWITCHTO_PLR_SPI_CONTEXT(the_caller_context) \
 	the_caller_context = MemoryContextSwitchTo(plr_SPI_context)
 #define CLEANUP_PLR_SPI_CONTEXT(the_caller_context) \
 	MemoryContextSwitchTo(the_caller_context)
+/*
+ * Catch the PG-level error and stash a copy of it, but do NOT raise the R
+ * error (via error()/Rf_error) here: that performs its own longjmp, which
+ * would skip past PG_END_TRY() and leave PG_exception_stack pointing at the
+ * (about-to-be-unwound) jmp_buf declared inside this PG_TRY block. Deferring
+ * the R-level error to PLR_PG_END_TRY(), after PG_END_TRY() has properly
+ * restored PG_exception_stack, avoids that dangling pointer.
+ */
 #define PLR_PG_CATCH() \
 		PG_CATCH(); \
 		{ \
 			MemoryContext temp_context; \
-			ErrorData  *edata; \
 			SWITCHTO_PLR_SPI_CONTEXT(temp_context); \
-			edata = CopyErrorData(); \
+			plr_caught_edata = CopyErrorData(); \
+			FlushErrorState(); \
 			MemoryContextSwitchTo(temp_context); \
-			error("error in SQL statement : %s", edata->message); \
 		}
 #define PLR_PG_END_TRY() \
-	PG_END_TRY()
+	PG_END_TRY(); \
+	if (plr_caught_edata) \
+		error("error in SQL statement : %s", plr_caught_edata->message)
 
 /*
  * structs
@@ -587,19 +608,28 @@ extern Datum r_get_pg(SEXP rval, plr_function *function, FunctionCallInfo fcinfo
 extern Datum get_datum(SEXP rval, Oid typid, Oid typelem, FmgrInfo in_func, bool *isnull);
 extern Datum get_scalar_datum(SEXP rval, Oid result_typ, FmgrInfo result_in_func, bool *isnull);
 
-/* Postgres support functions installed into the R interpreter */
-extern void throw_pg_notice(const char **msg);
-extern SEXP plr_quote_literal(SEXP rawstr);
-extern SEXP plr_quote_ident(SEXP rawstr);
-extern SEXP plr_SPI_exec(SEXP rsql);
-extern SEXP plr_SPI_prepare(SEXP rsql, SEXP rargtypes);
-extern SEXP plr_SPI_execp(SEXP rsaved_plan, SEXP rargvalues);
-extern SEXP plr_SPI_cursor_open(SEXP cursor_name_arg,SEXP rsaved_plan, SEXP rargvalues);
-extern SEXP plr_SPI_cursor_fetch(SEXP cursor_in,SEXP forward_in, SEXP rows_in);
-extern void plr_SPI_cursor_close(SEXP cursor_in);
-extern void plr_SPI_cursor_move(SEXP cursor_in, SEXP forward_in, SEXP rows_in);
-extern SEXP plr_SPI_lastoid(void);
-extern void throw_r_error(const char **msg);
+/*
+ * Postgres support functions installed into the R interpreter. These are
+ * looked up by NAME at runtime via R's .C()/.Call() (see the embedded R
+ * closures in plr.c, e.g. `pg.thrownotice <- function(msg) {.C("throw_pg_notice", ...)}`),
+ * not through Postgres's own PG_FUNCTION_INFO_V1/fmgr lookup. PGXS now
+ * builds extensions with -fvisibility=hidden by default, so without an
+ * explicit PGDLLEXPORT these symbols are absent from plr.so's dynamic
+ * symbol table and R's .C()/.Call() fails with "symbol name ... not in
+ * load table".
+ */
+extern PGDLLEXPORT void throw_pg_notice(const char **msg);
+extern PGDLLEXPORT SEXP plr_quote_literal(SEXP rawstr);
+extern PGDLLEXPORT SEXP plr_quote_ident(SEXP rawstr);
+extern PGDLLEXPORT SEXP plr_SPI_exec(SEXP rsql);
+extern PGDLLEXPORT SEXP plr_SPI_prepare(SEXP rsql, SEXP rargtypes);
+extern PGDLLEXPORT SEXP plr_SPI_execp(SEXP rsaved_plan, SEXP rargvalues);
+extern PGDLLEXPORT SEXP plr_SPI_cursor_open(SEXP cursor_name_arg,SEXP rsaved_plan, SEXP rargvalues);
+extern PGDLLEXPORT SEXP plr_SPI_cursor_fetch(SEXP cursor_in,SEXP forward_in, SEXP rows_in);
+extern PGDLLEXPORT void plr_SPI_cursor_close(SEXP cursor_in);
+extern PGDLLEXPORT void plr_SPI_cursor_move(SEXP cursor_in, SEXP forward_in, SEXP rows_in);
+extern PGDLLEXPORT SEXP plr_SPI_lastoid(void);
+extern PGDLLEXPORT void throw_r_error(const char **msg);
 
 /* Postgres callable functions useful in conjunction with PL/R */
 extern Datum plr_version(PG_FUNCTION_ARGS);

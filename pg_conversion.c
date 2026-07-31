@@ -477,7 +477,7 @@ pg_tuple_get_r_frame(int ntuples, HeapTuple *tuples, TupleDesc tupdesc)
 	for (j = 0; j < nc; j++)
 	{
 #if GP_VERSION_NUM >= 70000
-		if (!tupdesc->attrs[j].attisdropped)
+		if (!TupleDescAttr(tupdesc, j)->attisdropped)
 #else
 		if (!tupdesc->attrs[j]->attisdropped)
 #endif
@@ -506,7 +506,7 @@ pg_tuple_get_r_frame(int ntuples, HeapTuple *tuples, TupleDesc tupdesc)
 
 		/* ignore dropped attributes */
 #if GP_VERSION_NUM >= 70000
-		if (tupdesc->attrs[j].attisdropped)
+		if (TupleDescAttr(tupdesc, j)->attisdropped)
 			continue;
 #else
 		if (tupdesc->attrs[j]->attisdropped)
@@ -810,7 +810,7 @@ get_trigger_tuple(SEXP rval, plr_function *function, FunctionCallInfo fcinfo, bo
 	for (j = 0; j < nc; j++)
 	{
 #if GP_VERSION_NUM >= 70000
-		if (tupdesc->attrs[j].attisdropped)
+		if (TupleDescAttr(tupdesc, j)->attisdropped)
 #else
 		if (tupdesc->attrs[j]->attisdropped)
 #endif
@@ -877,7 +877,7 @@ get_trigger_tuple(SEXP rval, plr_function *function, FunctionCallInfo fcinfo, bo
 		{
 			/* insert NULL for dropped attributes */
 #if GP_VERSION_NUM >= 70000
-			if (tupdesc->attrs[j].attisdropped)
+			if (TupleDescAttr(tupdesc, j)->attisdropped)
 #else
 			if (tupdesc->attrs[j]->attisdropped)
 #endif
@@ -1894,9 +1894,7 @@ get_frame_tuplestore(SEXP rval,
 	HeapTuple			tuple;
 	TupleDesc			tupdesc = attinmeta->tupdesc;
 	int					tupdesc_nc = tupdesc->natts;
-#if GP_VERSION_NUM >= 70000
-	Form_pg_attribute  attrs = tupdesc->attrs;
-#else
+#if GP_VERSION_NUM < 70000
 	Form_pg_attribute  *attrs = tupdesc->attrs;
 #endif
 	MemoryContext		oldcontext;
@@ -1946,7 +1944,7 @@ get_frame_tuplestore(SEXP rval,
 		PROTECT(dfcol = VECTOR_ELT(rval, j));
 		if((!isFactor(dfcol)) &&
 #if GP_VERSION_NUM >= 70000
-		   ((attrs[j].attndims == 0) ||
+		   ((TupleDescAttr(tupdesc, j)->attndims == 0) ||
 #else
 		   ((attrs[j]->attndims == 0) ||
 #endif
@@ -1959,7 +1957,7 @@ get_frame_tuplestore(SEXP rval,
 			UNPROTECT(1);
 		}
 #if GP_VERSION_NUM >= 70000
-		else if(attrs[j].attndims != 0)	/* array data type */
+		else if(TupleDescAttr(tupdesc, j)->attndims != 0)	/* array data type */
 #else
 		else if(attrs[j]->attndims != 0)	/* array data type */
 #endif
@@ -2039,13 +2037,13 @@ get_frame_tuplestore(SEXP rval,
 			else
 			{
 #if GP_VERSION_NUM >= 70000
-				if ((attrs[j].attndims != 0) || (STRING_ELT(dfcol, i) != NA_STRING))
+				if ((TupleDescAttr(tupdesc, j)->attndims != 0) || (STRING_ELT(dfcol, i) != NA_STRING))
 #else
 				if ((attrs[j]->attndims != 0) || (STRING_ELT(dfcol, i) != NA_STRING))
 #endif
 				{
 #if GP_VERSION_NUM >= 70000
-					if (attrs[j].attndims == 0)
+					if (TupleDescAttr(tupdesc, j)->attndims == 0)
 #else
 					if (attrs[j]->attndims == 0)
 #endif
@@ -2075,8 +2073,8 @@ get_frame_tuplestore(SEXP rval,
 #endif
 							FmgrInfo				flinfo;
 							Datum					dvalue;
-#if GP_VERSION_NUM >= 70000	
-							MemSet(&fake_fcinfo, 0, SizeForFunctionCallInfo(1));
+#if GP_VERSION_NUM >= 70000
+							MemSet(fake_fcinfo, 0, SizeForFunctionCallInfo(1));
 							MemSet(&flinfo, 0, sizeof(flinfo));
 							fake_fcinfo->flinfo = &flinfo;
 							flinfo.fn_mcxt = CurrentMemoryContext;
@@ -2086,7 +2084,7 @@ get_frame_tuplestore(SEXP rval,
 							fake_fcinfo->nargs = 1;
 							fake_fcinfo->args[0].value = arr_datum;
 							fake_fcinfo->args[0].isnull= false;
-							dvalue = (*array_out)(&fake_fcinfo);
+							dvalue = array_out(fake_fcinfo);
 							if (fake_fcinfo->isnull)
 								values[j] = NULL;
 							else
@@ -2135,10 +2133,6 @@ get_frame_tuplestore(SEXP rval,
 				pfree(values[j]);
 	}
 	UNPROTECT(1);
-
-	oldcontext = MemoryContextSwitchTo(per_query_ctx);
-	tuplestore_donestoring(tupstore);
-	MemoryContextSwitchTo(oldcontext);
 
 	return tupstore;
 }
@@ -2203,10 +2197,6 @@ get_matrix_tuplestore(SEXP rval,
 	}
 	UNPROTECT(1);
 
-	oldcontext = MemoryContextSwitchTo(per_query_ctx);
-	tuplestore_donestoring(tupstore);
-	MemoryContextSwitchTo(oldcontext);
-
 	return tupstore;
 }
 
@@ -2266,10 +2256,6 @@ get_generic_tuplestore(SEXP rval,
 		MemoryContextSwitchTo(oldcontext);
 	}
 	UNPROTECT(1);
-
-	oldcontext = MemoryContextSwitchTo(per_query_ctx);
-	tuplestore_donestoring(tupstore);
-	MemoryContextSwitchTo(oldcontext);
 
 	return tupstore;
 }
