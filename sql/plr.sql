@@ -288,6 +288,26 @@ create or replace function test_foo(foo) returns foo as 'return(arg1)' language 
 select * from test_foo(get_foo(1));
 
 --
+-- test non-SETOF composite return
+--
+-- A composite-returning function that is not declared SETOF must hand back a
+-- single composite Datum rather than a tuplestore: the executor only accepts
+-- SFRM_Materialize from a function declared SETOF, and Greenplum rewrites
+-- "SELECT * FROM f()" for a single-row volatile function into an InitPlan
+-- expression, where there is no ReturnSetInfo at all.
+--
+create or replace function test_comp_nonset() returns foo as 'data.frame(f0=42L, f1="nonset", f2=3.25)' language 'plr';
+select * from test_comp_nonset();
+select (test_comp_nonset()).f1 as "targetlist";
+create or replace function test_comp_arg(int) returns foo as 'data.frame(f0=arg1, f1="built", f2=arg1*1.5)' language 'plr';
+select * from test_comp_arg(7);
+create or replace function test_comp_null() returns foo as 'return(NULL)' language 'plr';
+select test_comp_null() is null as "null_composite";
+-- the SETOF counterpart must keep working
+create or replace function test_comp_set() returns setof foo as 'data.frame(f0=c(1L,2L), f1=c("a","b"), f2=c(1.5,2.5))' language 'plr';
+select * from test_comp_set();
+
+--
 -- test 2D array argument
 --
 create or replace function test_in_m_tup(_int4) returns setof record as 'arg1' language 'plr';

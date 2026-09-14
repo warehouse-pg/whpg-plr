@@ -82,15 +82,36 @@
 #include <sys/stat.h>
 
 /*
- * The R headers define various symbols that are also defined by the
- * Postgres headers, so undef them first to avoid conflicts. Capture
- * Postgres's real numeric values first so they can be restored exactly
- * afterwards - hardcoding them (as this used to do: WARNING=19, ERROR=20)
- * silently goes stale whenever Postgres inserts a new elevel in between
- * (e.g. WARNING_CLIENT_ONLY=20 shifted ERROR to 21 in PG18+), causing
- * every ereport(ERROR, ...) in this file to actually report at whatever
- * *other* level the stale number now belongs to - reported to the client,
- * but never throwing.
+ * Older R headers define symbols also named ERROR/WARNING, so these are
+ * #undef'd around the R includes below and restored afterwards. (R 4.5.1
+ * no longer defines either, but the dance is kept so the extension still
+ * builds against the older R releases upstream supports.)
+ *
+ * The restored values are CAPTURED FROM THE SERVER HEADERS here, before the
+ * #undef, rather than written out as literals. This file used to restore
+ * them as hardcoded numerics (WARNING=19, ERROR=20), which silently went
+ * stale as soon as Postgres inserted a new elevel in between: PG18+ added
+ * WARNING_CLIENT_ONLY=20, shifting the real ERROR to 21. Every
+ * ereport(ERROR, ...) in PL/R then reported at WARNING_CLIENT_ONLY - shown
+ * to the client but never throwing - after which execution fell through
+ * code that assumed it had aborted, and crashed the backend.
+ *
+ * Capture-and-restore is preferred over the other obvious fix, renaming
+ * PL/R's own colliding symbols, because it is local to this one header:
+ * renaming would mean touching every ereport()/elog() call site across
+ * plr.c and the pg_*.c files, and any call site missed - or any added later
+ * out of habit - would silently pick up R's meaning of the name instead.
+ * Here the values can only ever be whatever elog.h says on the server being
+ * built against, so the failure mode above cannot recur on a future line.
+ *
+ * Upstream PL/R (REL8_4_8_7) instead restores from PostgreSQL's own
+ * PGWARNING/PGERROR aliases, but keeps "#else #define WARNING 19 / #define
+ * ERROR 20" fallbacks for servers that do not define them - and WHPG7's
+ * elog.h defines PGERROR but NOT PGWARNING, so on this fork's older line
+ * that approach still lands on a hardcoded literal. Capturing the values
+ * directly needs no such fallback and is correct on both lines.
+ *
+ * test/elevel_check.c asserts this end to end, per server line, at runtime.
  */
 enum { PLR_PG_REAL_WARNING = WARNING, PLR_PG_REAL_ERROR = ERROR };
 

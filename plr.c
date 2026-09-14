@@ -1107,14 +1107,36 @@ do_compile(FunctionCallInfo fcinfo,
 			int				i;
 			ReturnSetInfo  *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 			
-			/* check to see if caller supports us returning a tuplestore */
-			if (!rsinfo || !(rsinfo->allowedModes & SFRM_Materialize) || rsinfo->expectedDesc == NULL)
-				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR),
-				 		errmsg("materialize mode required, but it is not "
-								"allowed in this context")));
+			/*
+			 * A function declared SETOF, or one returning an anonymous
+			 * RECORD whose shape is only known from the call site, has to
+			 * hand its rows back through a tuplestore - so it genuinely
+			 * requires a caller that supports materialize mode.
+			 *
+			 * A non-SETOF *named* composite does not: its row type is fixed
+			 * by the declaration and it returns a single composite Datum.
+			 * Such a call legitimately arrives with no ReturnSetInfo at all
+			 * - Greenplum rewrites "SELECT * FROM f()" for a single-row
+			 * volatile function into an InitPlan expression rather than a
+			 * function scan - so demanding rsinfo here rejected every such
+			 * call with a spurious "materialize mode required".
+			 */
+			if (!fcinfo->flinfo->fn_retset &&
+				procStruct->prorettype != RECORDOID)
+			{
+				tupdesc = lookup_rowtype_tupdesc_copy(procStruct->prorettype, -1);
+			}
+			else
+			{
+				/* check to see if caller supports us returning a tuplestore */
+				if (!rsinfo || !(rsinfo->allowedModes & SFRM_Materialize) || rsinfo->expectedDesc == NULL)
+					ereport(ERROR,
+							(errcode(ERRCODE_SYNTAX_ERROR),
+					 		errmsg("materialize mode required, but it is not "
+									"allowed in this context")));
 
-			tupdesc = rsinfo->expectedDesc;
+				tupdesc = rsinfo->expectedDesc;
+			}
 			function->result_natts = tupdesc->natts;
 			
 			function->result_fld_elem_typid = (Oid *)

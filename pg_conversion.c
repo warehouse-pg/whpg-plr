@@ -64,6 +64,8 @@ static Tuplestorestate *get_generic_tuplestore(SEXP rval,
 											 AttInMetadata *attinmeta,
 											 MemoryContext per_query_ctx,
 											 bool retset);
+static Datum get_composite_datum(SEXP rval, plr_function *function,
+								 FunctionCallInfo fcinfo, bool *isnull);
 static SEXP coerce_to_char(SEXP rval);
 
 extern char *last_R_error_msg;
@@ -703,8 +705,10 @@ r_get_pg(SEXP rval, plr_function *function, FunctionCallInfo fcinfo)
 
 	if (CALLED_AS_TRIGGER(fcinfo))
 		result = get_trigger_tuple(rval, function, fcinfo, &isnull);
-	else if (function->result_istuple || fcinfo->flinfo->fn_retset)
+	else if (fcinfo->flinfo->fn_retset)
 		result = get_tuplestore(rval, function, fcinfo, &isnull);
+	else if (function->result_istuple)
+		result = get_composite_datum(rval, function, fcinfo, &isnull);
 	else
 	{
 		/* short circuit if return value is Null */
@@ -1013,6 +1017,97 @@ get_tuplestore(SEXP rval, plr_function *function, FunctionCallInfo fcinfo, bool 
 
 	*isnull = true;
 	return (Datum) 0;
+}
+
+/*
+ * Build a single composite Datum from an R value.
+ *
+ * A PL/R function declared to return a composite type *without* SETOF has to
+ * hand back one composite Datum. Routing it through the tuplestore /
+ * SFRM_Materialize path instead is a protocol violation: the executor only
+ * accepts materialize mode from a function declared SETOF - see the
+ * returnsSet test in ExecMakeTableFunctionResult() (execSRF.c) - so such a
+ * call fails with "table-function protocol for materialize mode was not
+ * followed". Older servers did not test returnsSet there and so happened to
+ * tolerate it, which is why this only surfaced on the newer server line.
+ *
+ * The per-shape R -> row conversion is deliberately reused from the
+ * tuplestore builders (called with retset = false, so they stop after a
+ * single row) rather than duplicated here.
+ */
+static Datum
+get_composite_datum(SEXP rval, plr_function *function,
+					FunctionCallInfo fcinfo, bool *isnull)
+{
+	TupleDesc			tupdesc;
+	AttInMetadata	   *attinmeta;
+	Tuplestorestate	   *tupstore;
+	TupleTableSlot	   *slot;
+	HeapTuple			tuple;
+	Datum				result;
+	int					nc;
+
+	/* a NULL R value maps to a NULL composite */
+	if (rval == R_NilValue || isNull(rval))
+	{
+		*isnull = true;
+		return (Datum) 0;
+	}
+
+	/*
+	 * Resolve the declared row type. Deliberately not taken from
+	 * rsinfo->expectedDesc: there is no ReturnSetInfo at all when a
+	 * non-SETOF composite function is called outside a FROM clause.
+	 */
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("function returning record called in context "
+						"that cannot accept type record")));
+
+	/* same column-count check the tuplestore path applies */
+	if (isFrame(rval) || isList(rval) || isNewList(rval))
+		nc = length(rval);
+	else if (isMatrix(rval))
+		nc = ncols(rval);
+	else
+		nc = 1;
+
+	if (nc != tupdesc->natts)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("query-specified return tuple and "
+						"function returned data.frame are not compatible")));
+
+	BlessTupleDesc(tupdesc);
+	attinmeta = TupleDescGetAttInMetadata(tupdesc);
+
+	if (isFrame(rval) || isList(rval) || isNewList(rval))
+		tupstore = get_frame_tuplestore(rval, function, attinmeta,
+										CurrentMemoryContext, false);
+	else if (isMatrix(rval))
+		tupstore = get_matrix_tuplestore(rval, function, attinmeta,
+										 CurrentMemoryContext, false);
+	else
+		tupstore = get_generic_tuplestore(rval, function, attinmeta,
+										  CurrentMemoryContext, false);
+
+	/* pull the single row back out and return it as a composite Datum */
+	slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsMinimalTuple);
+	if (!tuplestore_gettupleslot(tupstore, true, false, slot))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("PL/R function returned no row for a composite result")));
+
+	tuple = ExecCopySlotHeapTuple(slot);
+	result = heap_copy_tuple_as_datum(tuple, tupdesc);
+
+	heap_freetuple(tuple);
+	ExecDropSingleTupleTableSlot(slot);
+	tuplestore_end(tupstore);
+
+	*isnull = false;
+	return result;
 }
 
 Datum
