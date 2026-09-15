@@ -1093,7 +1093,12 @@ get_composite_datum(SEXP rval, plr_function *function,
 										  CurrentMemoryContext, false);
 
 	/* pull the single row back out and return it as a composite Datum */
+#if GP_VERSION_NUM >= 70000
 	slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsMinimalTuple);
+#else
+	/* pre-GP7 has no pluggable tuple-table slots, so no ops argument */
+	slot = MakeSingleTupleTableSlot(tupdesc);
+#endif
 	if (!tuplestore_gettupleslot(tupstore, true, false, slot))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_EXCEPTION),
