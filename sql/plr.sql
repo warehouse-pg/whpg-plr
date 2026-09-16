@@ -138,6 +138,9 @@ select sprintf('%s is %s feet tall', 'Sven', '7');
 -- was removed in PostgreSQL 12, hence the branch (upstream does the same); the
 -- DISTRIBUTED clause is explicit on both so Greenplum emits no distribution
 -- NOTICE into the expected output.
+-- Greenplum 6 warns "OIDS=TRUE is not recommended for user-created tables"
+-- when the pre-12 arm runs; silence it so one expected file serves every line.
+set client_min_messages to warning;
 do language plpgsql $body$
 declare
   pre_12 bool;
@@ -150,6 +153,7 @@ begin
   end if;
 end
 $body$;
+set client_min_messages to notice;
 insert into foo values(1,'cat1',1.21);
 insert into foo values(2,'cat1',1.24);
 insert into foo values(3,'cat1',1.18);
