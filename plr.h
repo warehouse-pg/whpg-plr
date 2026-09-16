@@ -2,7 +2,7 @@
  * PL/R - PostgreSQL support for R as a
  *	      procedural language (PL)
  *
- * Copyright (c) 2003-2015 by Joseph E. Conway
+ * Copyright (c) 2003-2018 by Joseph E. Conway
  * ALL RIGHTS RESERVED
  * 
  * Joe Conway <mail@joeconway.com>
@@ -33,12 +33,15 @@
 #ifndef PLR_H
 #define PLR_H
 
-#define PLR_VERSION		"08.03.00.16"
+#define PLR_VERSION		"8.4"
 
 #include "postgres.h"
 
 #include "fmgr.h"
 #include "funcapi.h"
+#if PG_VERSION_NUM >= 190000
+#include "nodes/execnodes.h"
+#endif
 #include "miscadmin.h"
 #if PG_VERSION_NUM >= 80400
 #include "windowapi.h"
@@ -63,7 +66,12 @@
 #include "storage/ipc.h"
 #include "tcop/tcopprot.h"
 #include "utils/array.h"
+
 #include "utils/builtins.h"
+#if PG_VERSION_NUM >= 190000
+#include "utils/tuplestore.h"
+#endif
+
 #if PG_VERSION_NUM >= 80500
 #include "utils/bytea.h"
 #endif
@@ -117,7 +125,7 @@ enum { PLR_PG_REAL_WARNING = WARNING, PLR_PG_REAL_ERROR = ERROR };
 #if (R_VERSION >= 132096) /* R_VERSION >= 2.4.0 */
 #include "Rembedded.h"
 #endif
-#if !defined(WIN32) && !defined(WIN64)
+#if !defined(WIN32) && !defined(WIN64) && !((defined(_WIN64)) && defined(_UCRT))
 #include "Rinterface.h"
 #else
 extern int R_SignalHandlers;
@@ -126,6 +134,94 @@ extern int R_SignalHandlers;
 #include "Rdefines.h"
 #if (R_VERSION < 133120) /* R_VERSION < 2.8.0 */
 #include "Rdevices.h"
+#endif
+
+/*
+ * Internal workaround to trivial change in R 4.6.0 file Rinlinedfuns.h
+ *
+ * The function Rf_isFrame has been removed; use Rf_isDataFrame instead.
+ * https://cran.r-project.org/bin/windows/base/NEWS.R-devel.html (to become R 4.6.0)
+ *
+ * Remove Rf_isFrame.
+ * https://github.com/wch/r-source/commit/ed5b0de133af71bc80ef110b738861457d00db44#diff-788284f8cfbf5d10400569f32a80fd157c22f994cf8f9f4de91df4289caa724dL922
+ *
+ */
+#if (R_SVN_REVISION >= 89488) /* R_VERSION >= 4.6.0 */
+#define IS_DATAFRAME(rval) isDataFrame(rval)
+#else
+#define IS_DATAFRAME(rval) isFrame(rval)
+#endif
+
+/*
+ * Internal workaround to a trivial change in R 4.4.1 file Rinternals.h
+ *
+ * (Removal of the code line "void (SET_TYPEOF)(SEXP x, int v);")
+ * Remove some non-API declarations from Rinternals.h
+ * https://github.com/wch/r-source/commit/23ce2dba89aa706a090277b10a294fa6dd474950#diff-f80fbe1c24fd75e44326c4169107c6db214b7188f2a16464ff38b248417164fdL1290
+ *
+ * The new function Rf_allocLang is now available. 
+ * This provides an alternative to the idiom of calling Rf_allocList followed by SET_TYPEOF.
+ * https://cran.r-project.org/bin/windows/base/NEWS.R-devel.html (R 4.4.1)
+ *
+ * Add allocLang to make it easier to avoid using SET_TYPEOF.
+ * https://github.com/wch/r-source/commit/6b72cd1b3f458896a6a3346f75313e8fbde4c2e0
+ *
+ */
+#if (R_SVN_REVISION >= 86737) /* R_VERSION >= 4.4.1 */
+#define SET_ALLOCLANG_SIZE(allocLang_size, s, t) \
+  do { \
+    t = s = PROTECT(allocLang(allocLang_size)); \
+  } while (0)
+#else /* R_VERSION < 4.4.1 */
+#define SET_ALLOCLANG_SIZE(allocLang_size, s, t) \
+  do { \
+    PROTECT(t = s = allocList(allocLang_size)); \
+    SET_TYPEOF(s, LANGSXP); \
+  } while (0)
+#endif
+
+/*
+ * Internal workarounds to
+ * trivial changeS in R 4.5.3/bleeding-edge files Defn.h and Rinternals.h
+ *
+ * (Switch to remove from end-user the view of the legacy API)
+ * Disable legacy non-API declarations.
+ * https://github.com/wch/r-source/commit/80a441bfda15ae27ee3897aa51d583cfbfd0c9c2
+ *
+ * (Puts ATTRIB and Rf_findVar in the legacy API group of functions)
+ * Allow separate contol of legacy functions and variables
+ * https://github.com/wch/r-source/commit/b2f593caa4cd76b74eaf3c72f228768e7df71809
+ *
+ * Changes in R 4.6.0. C-Level Facilities.
+ * In preparation for removing declarations
+ * and, where possible, hide this entry point ATTRIB.
+ * New function R_getVar.
+ * In most cases this can be used instead of the non-API function Rf_findVar.
+ * Seen 4/16/2026
+ * Changes in R-devel
+ * https://cran.r-project.org/bin/windows/base/NEWS.R-devel.html
+ *
+ * 5.9.12 Named objects and copying
+ * ANY_ATTRIB checks whether there are any attributes
+ * 6.21.1 Some API replacements for non-API entry points
+ * [Pause using] Rf_findVar. [Instead] use R_getVar.
+ * Seen 4/16/2026
+ * This manual is for R, version 4.5.3 (2026-03-11).
+ * https://cran.r-project.org/doc/manuals/r-release/R-exts.html
+ *
+ * (Moves ATTRIB and Rf_findVar from the file Rinternals.h to Defn.h.)
+ * Rearrange to allow turning off the tools:::warnNonAPI entry point declarations.
+ * https://github.com/wch/r-source/commit/906fe07b05e415c5425bcfe7024891c33cad6096
+ *
+ */
+#if (R_SVN_REVISION >= 89598) /* R_VERSION >= 4.5.3 */ 
+# define FINDVAR(sym, rho) R_getVar(sym, rho, TRUE)
+# define TYPEOF_CAR(dfcol) TYPEOF(CAR(dfcol))
+#else
+# define FINDVAR(sym, rho) findVar(sym, rho)
+# define TYPEOF_CAR(dfcol) TYPEOF(CAR(ATTRIB(dfcol)))
+# define ANY_ATTRIB(t) (ATTRIB(t) != R_NilValue)
+# define NO_ATTRIB(t) (! ANY_ATTRIB(t))
 #endif
 
 /* Restore the Postgres headers */
@@ -138,6 +234,20 @@ extern int R_SignalHandlers;
 #undef WARNING
 #endif
 
+/*
+ * Restore from the values captured above, not from literals.
+ *
+ * Upstream REL8_4_8_7 restores these from PostgreSQL's own PGWARNING/PGERROR
+ * aliases but keeps "#else #define WARNING 19 / #define ERROR 20" fallbacks.
+ * WHPG7's elog.h defines PGERROR but NOT PGWARNING, so on that line upstream's
+ * form still lands on a hardcoded literal. Capturing the real values needs no
+ * fallback and is correct on every server line.
+ *
+ * This matters because a stale literal here is silent: PG18+ inserted
+ * WARNING_CLIENT_ONLY=20, shifting real ERROR to 21, which turned every
+ * ereport(ERROR, ...) in PL/R into a non-throwing client report and crashed
+ * the backend. test/elevel_check.c asserts this end to end per server line.
+ */
 #define WARNING		PLR_PG_REAL_WARNING
 #define ERROR		PLR_PG_REAL_ERROR
 
@@ -168,6 +278,12 @@ extern int R_SignalHandlers;
 #define HAVE_WINDOW_FUNCTIONS
 #endif
 
+#if PG_VERSION_NUM >= 110000 
+#define TUPLE_DESC_ATTR(tupdesc,i) TupleDescAttr(tupdesc,i)
+#else 
+#define TUPLE_DESC_ATTR(tupdesc,i) tupdesc->attrs[i] 
+#endif
+		
 #ifdef DEBUGPROTECT
 #undef PROTECT
 extern SEXP pg_protect(SEXP s, char *fn, int ln);
@@ -323,129 +439,80 @@ extern void R_RunExitFinalizers(void);
 	HeapTupleHeader	dnewtup; \
 	HeapTupleHeader	dtrigtup
 
-#if GP_VERSION_NUM >= 70000
-#define SET_INSERT_ARGS_567 \
-	do { \
-		nullablearg[5].value = DirectFunctionCall1(textin, CStringGetDatum("INSERT")); \
-		tup = trigdata->tg_trigtuple; \
-		dtrigtup = (HeapTupleHeader) palloc(tup->t_len); \
-		memcpy((char *) dtrigtup, (char *) tup->t_data, tup->t_len); \
-		HeapTupleHeaderSetDatumLength(dtrigtup, tup->t_len); \
-		HeapTupleHeaderSetTypeId(dtrigtup, tupdesc->tdtypeid); \
-		HeapTupleHeaderSetTypMod(dtrigtup, tupdesc->tdtypmod); \
-		nullablearg[6].value = PointerGetDatum(dtrigtup); \
-		nullablearg[6].isnull = false; \
-		nullablearg[7].value = (Datum) 0; \
-		nullablearg[7].isnull = true; \
-	} while (0)
-#define SET_DELETE_ARGS_567 \
-	do { \
-		nullablearg[5].value = DirectFunctionCall1(textin, CStringGetDatum("DELETE")); \
-		nullablearg[6].value = (Datum) 0; \
-		nullablearg[6].isnull = true; \
-		tup = trigdata->tg_trigtuple; \
-		dtrigtup = (HeapTupleHeader) palloc(tup->t_len); \
-		memcpy((char *) dtrigtup, (char *) tup->t_data, tup->t_len); \
-		HeapTupleHeaderSetDatumLength(dtrigtup, tup->t_len); \
-		HeapTupleHeaderSetTypeId(dtrigtup, tupdesc->tdtypeid); \
-		HeapTupleHeaderSetTypMod(dtrigtup, tupdesc->tdtypmod); \
-		nullablearg[7].value = PointerGetDatum(dtrigtup); \
-		nullablearg[7].isnull = false; \
-	} while (0)
-#define SET_UPDATE_ARGS_567 \
-	do { \
-		nullablearg[5].value = DirectFunctionCall1(textin, CStringGetDatum("UPDATE")); \
-		tup = trigdata->tg_newtuple; \
-		dnewtup = (HeapTupleHeader) palloc(tup->t_len); \
-		memcpy((char *) dnewtup, (char *) tup->t_data, tup->t_len); \
-		HeapTupleHeaderSetDatumLength(dnewtup, tup->t_len); \
-		HeapTupleHeaderSetTypeId(dnewtup, tupdesc->tdtypeid); \
-		HeapTupleHeaderSetTypMod(dnewtup, tupdesc->tdtypmod); \
-		nullablearg[6].value = PointerGetDatum(dnewtup); \
-		nullablearg[6].isnull = false; \
-		tup = trigdata->tg_trigtuple; \
-		dtrigtup = (HeapTupleHeader) palloc(tup->t_len); \
-		memcpy((char *) dtrigtup, (char *) tup->t_data, tup->t_len); \
-		HeapTupleHeaderSetDatumLength(dtrigtup, tup->t_len); \
-		HeapTupleHeaderSetTypeId(dtrigtup, tupdesc->tdtypeid); \
-		HeapTupleHeaderSetTypMod(dtrigtup, tupdesc->tdtypmod); \
-		nullablearg[7].value = PointerGetDatum(dtrigtup); \
-		nullablearg[7].isnull = false; \
-	} while (0)
-#define CONVERT_TUPLE_TO_DATAFRAME \
-	do { \
-		Oid			tupType; \
-		int32		tupTypmod; \
-		TupleDesc	tupdesc; \
-		HeapTuple	tuple = palloc(sizeof(HeapTupleData)); \
-		HeapTupleHeader	tuple_hdr = DatumGetHeapTupleHeader(nullablearg[i].value); \
-		tupType = HeapTupleHeaderGetTypeId(tuple_hdr); \
-		tupTypmod = HeapTupleHeaderGetTypMod(tuple_hdr); \
-		tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod); \
-		tuple->t_len = HeapTupleHeaderGetDatumLength(tuple_hdr); \
-		ItemPointerSetInvalid(&(tuple->t_self)); \
-		/* tuple->t_tableOid = InvalidOid; */\
-		tuple->t_data = tuple_hdr; \
-		PROTECT(el = pg_tuple_get_r_frame(1, &tuple, tupdesc)); \
-		ReleaseTupleDesc(tupdesc); \
-		pfree(tuple); \
-	} while (0)
+
+#if (PG_VERSION_NUM >= 120000)
+
+#define SET_ARG(val, null, index) \
+    do { \
+	args[index].value=val; \
+	args[index].isnull =null; \
+    } while (0)
+
+#define IS_ARG_NULL(i) args[i].isnull
+#define GET_ARG_VALUE(i) args[i].value
+
 #else
+
+#define SET_ARG(val, null, index) \
+	do { \
+	arg[index]=val; \
+	argnull[index]=null; \
+	} while (0)
+
+#define IS_ARG_NULL(i) argnull[i]
+#define GET_ARG_VALUE(i) arg[i]
+
+#endif
+
 #define SET_INSERT_ARGS_567 \
 	do { \
-		arg[5] = DirectFunctionCall1(textin, CStringGetDatum("INSERT")); \
+		SET_ARG(DirectFunctionCall1(textin, CStringGetDatum("INSERT")),false,5); \
 		tup = trigdata->tg_trigtuple; \
 		dtrigtup = (HeapTupleHeader) palloc(tup->t_len); \
 		memcpy((char *) dtrigtup, (char *) tup->t_data, tup->t_len); \
 		HeapTupleHeaderSetDatumLength(dtrigtup, tup->t_len); \
 		HeapTupleHeaderSetTypeId(dtrigtup, tupdesc->tdtypeid); \
 		HeapTupleHeaderSetTypMod(dtrigtup, tupdesc->tdtypmod); \
-		arg[6] = PointerGetDatum(dtrigtup); \
-		argnull[6] = false; \
-		arg[7] = (Datum) 0; \
-		argnull[7] = true; \
+		SET_ARG(PointerGetDatum(dtrigtup),false,6); \
+		SET_ARG((Datum)0,true,7); \
 	} while (0)
 #define SET_DELETE_ARGS_567 \
 	do { \
-		arg[5] = DirectFunctionCall1(textin, CStringGetDatum("DELETE")); \
-		arg[6] = (Datum) 0; \
-		argnull[6] = true; \
+		SET_ARG(DirectFunctionCall1(textin, CStringGetDatum("DELETE")),false,5); \
+		SET_ARG((Datum) 0,true,6); \
 		tup = trigdata->tg_trigtuple; \
 		dtrigtup = (HeapTupleHeader) palloc(tup->t_len); \
 		memcpy((char *) dtrigtup, (char *) tup->t_data, tup->t_len); \
 		HeapTupleHeaderSetDatumLength(dtrigtup, tup->t_len); \
 		HeapTupleHeaderSetTypeId(dtrigtup, tupdesc->tdtypeid); \
 		HeapTupleHeaderSetTypMod(dtrigtup, tupdesc->tdtypmod); \
-		arg[7] = PointerGetDatum(dtrigtup); \
-		argnull[7] = false; \
+		SET_ARG(PointerGetDatum(dtrigtup),false,7); \
 	} while (0)
 #define SET_UPDATE_ARGS_567 \
 	do { \
-		arg[5] = DirectFunctionCall1(textin, CStringGetDatum("UPDATE")); \
+		SET_ARG(DirectFunctionCall1(textin, CStringGetDatum("UPDATE")),false,5); \
 		tup = trigdata->tg_newtuple; \
 		dnewtup = (HeapTupleHeader) palloc(tup->t_len); \
 		memcpy((char *) dnewtup, (char *) tup->t_data, tup->t_len); \
 		HeapTupleHeaderSetDatumLength(dnewtup, tup->t_len); \
 		HeapTupleHeaderSetTypeId(dnewtup, tupdesc->tdtypeid); \
 		HeapTupleHeaderSetTypMod(dnewtup, tupdesc->tdtypmod); \
-		arg[6] = PointerGetDatum(dnewtup); \
-		argnull[6] = false; \
+		SET_ARG(PointerGetDatum(dnewtup),false,6); \
 		tup = trigdata->tg_trigtuple; \
 		dtrigtup = (HeapTupleHeader) palloc(tup->t_len); \
 		memcpy((char *) dtrigtup, (char *) tup->t_data, tup->t_len); \
 		HeapTupleHeaderSetDatumLength(dtrigtup, tup->t_len); \
 		HeapTupleHeaderSetTypeId(dtrigtup, tupdesc->tdtypeid); \
 		HeapTupleHeaderSetTypMod(dtrigtup, tupdesc->tdtypmod); \
-		arg[7] = PointerGetDatum(dtrigtup); \
-		argnull[7] = false; \
+		SET_ARG(PointerGetDatum(dtrigtup),false,7); \
 	} while (0)
-#define CONVERT_TUPLE_TO_DATAFRAME \
+#define CONVERT_TUPLE_TO_DATAFRAME(tt) \
 	do { \
 		Oid			tupType; \
 		int32		tupTypmod; \
 		TupleDesc	tupdesc; \
 		HeapTuple	tuple = palloc(sizeof(HeapTupleData)); \
-		HeapTupleHeader	tuple_hdr = DatumGetHeapTupleHeader(arg[i]); \
+		HeapTupleHeader	tuple_hdr = DatumGetHeapTupleHeader(tt); \
 		tupType = HeapTupleHeaderGetTypeId(tuple_hdr); \
 		tupTypmod = HeapTupleHeaderGetTypMod(tuple_hdr); \
 		tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod); \
@@ -457,20 +524,9 @@ extern void R_RunExitFinalizers(void);
 		ReleaseTupleDesc(tupdesc); \
 		pfree(tuple); \
 	} while (0)
-#endif
 #define GET_ARG_NAMES \
 		char  **argnames; \
 		argnames = fetchArgNames(procTup, procStruct->pronargs)
-#define SET_ARG_NAME \
-	do { \
-		if (argnames && argnames[i] && argnames[i][0]) \
-		{ \
-			appendStringInfo(proc_internal_args, "%s", argnames[i]); \
-			pfree(argnames[i]); \
-		} \
-		else \
-			appendStringInfo(proc_internal_args, "arg%d", i + 1); \
-	} while (0)
 #define SET_FRAME_ARG_NAME \
 	do { \
 		appendStringInfo(proc_internal_args, "farg%d", i + 1); \
@@ -546,18 +602,11 @@ typedef struct plr_function
 	ItemPointerData		fn_tid;
 	plr_func_hashkey   *fn_hashkey; /* back-link to hashtable key */
 	bool				lanpltrusted;
-	Oid					result_typid;
-	bool				result_istuple;
-	FmgrInfo			result_in_func;
-	Oid					result_elem;
-	FmgrInfo			result_elem_in_func;
-	int					result_elem_typlen;
-	bool				result_elem_typbyval;
-	char				result_elem_typalign;
 	int					result_natts;
+	Oid				   *result_fld_typid;
 	Oid				   *result_fld_elem_typid;
 	FmgrInfo		   *result_fld_elem_in_func;
-	int				   *result_fld_elem_typlen;
+	int16			   *result_fld_elem_typlen;
 	bool			   *result_fld_elem_typbyval;
 	char			   *result_fld_elem_typalign;
 	int					nargs;
@@ -587,22 +636,22 @@ typedef struct plr_hashent
  * external declarations
  */
 
-/* libR interpreter initialization */
-extern int Rf_initEmbeddedR(int argc, char **argv);
-
 /* PL/R language handler */
-extern Datum plr_call_handler(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum plr_call_handler(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum plr_inline_handler(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum plr_validator(PG_FUNCTION_ARGS);
 extern void PLR_CLEANUP;
 extern void plr_init(void);
 extern void plr_load_modules(void);
 extern void load_r_cmd(const char *cmd);
-extern SEXP call_r_func(SEXP fun, SEXP rargs);
+extern SEXP call_r_func(SEXP fun, SEXP rargs, SEXP rho);
 
 /* argument and return value conversion functions */
 extern SEXP pg_scalar_get_r(Datum dvalue, Oid arg_typid, FmgrInfo arg_out_func);
 extern SEXP pg_array_get_r(Datum dvalue, FmgrInfo out_func, int typlen, bool typbyval, char typalign);
-extern SEXP pg_datum_array_get_r(Datum *elem_values, bool *elem_nulls, int numels, bool has_nulls,
-								 Oid element_type, FmgrInfo out_func, bool typbyval);
+#ifdef HAVE_WINDOW_FUNCTIONS
+extern SEXP pg_window_frame_get_r(WindowObject winobj, int argno, plr_function* function);
+#endif
 extern SEXP pg_tuple_get_r_frame(int ntuples, HeapTuple *tuples, TupleDesc tupdesc);
 extern Datum r_get_pg(SEXP rval, plr_function *function, FunctionCallInfo fcinfo);
 extern Datum get_datum(SEXP rval, Oid typid, Oid typelem, FmgrInfo in_func, bool *isnull);
@@ -611,38 +660,40 @@ extern Datum get_scalar_datum(SEXP rval, Oid result_typ, FmgrInfo result_in_func
 /*
  * Postgres support functions installed into the R interpreter. These are
  * looked up by NAME at runtime via R's .C()/.Call() (see the embedded R
- * closures in plr.c, e.g. `pg.thrownotice <- function(msg) {.C("throw_pg_notice", ...)}`),
- * not through Postgres's own PG_FUNCTION_INFO_V1/fmgr lookup. PGXS now
- * builds extensions with -fvisibility=hidden by default, so without an
- * explicit PGDLLEXPORT these symbols are absent from plr.so's dynamic
- * symbol table and R's .C()/.Call() fails with "symbol name ... not in
- * load table".
+ * closures in plr.c), not through Postgres's own PG_FUNCTION_INFO_V1/fmgr
+ * mechanism. PGXS builds extensions with -fvisibility=hidden by default, so
+ * without PGDLLEXPORT these symbols are absent from plr.so's dynamic symbol
+ * table and R's .C()/.Call() fails with "symbol name ... not in load table".
  */
-extern PGDLLEXPORT void throw_pg_notice(const char **msg);
-extern PGDLLEXPORT SEXP plr_quote_literal(SEXP rawstr);
-extern PGDLLEXPORT SEXP plr_quote_ident(SEXP rawstr);
-extern PGDLLEXPORT SEXP plr_SPI_exec(SEXP rsql);
-extern PGDLLEXPORT SEXP plr_SPI_prepare(SEXP rsql, SEXP rargtypes);
-extern PGDLLEXPORT SEXP plr_SPI_execp(SEXP rsaved_plan, SEXP rargvalues);
-extern PGDLLEXPORT SEXP plr_SPI_cursor_open(SEXP cursor_name_arg,SEXP rsaved_plan, SEXP rargvalues);
-extern PGDLLEXPORT SEXP plr_SPI_cursor_fetch(SEXP cursor_in,SEXP forward_in, SEXP rows_in);
-extern PGDLLEXPORT void plr_SPI_cursor_close(SEXP cursor_in);
-extern PGDLLEXPORT void plr_SPI_cursor_move(SEXP cursor_in, SEXP forward_in, SEXP rows_in);
-extern PGDLLEXPORT SEXP plr_SPI_lastoid(void);
-extern PGDLLEXPORT void throw_r_error(const char **msg);
+PGDLLEXPORT void throw_pg_log(int* elevel, const char **msg);
+PGDLLEXPORT SEXP plr_quote_literal(SEXP rawstr);
+PGDLLEXPORT SEXP plr_quote_ident(SEXP rawstr);
+PGDLLEXPORT SEXP plr_SPI_exec(SEXP rsql);
+PGDLLEXPORT SEXP plr_SPI_prepare(SEXP rsql, SEXP rargtypes);
+PGDLLEXPORT SEXP plr_SPI_execp(SEXP rsaved_plan, SEXP rargvalues);
+PGDLLEXPORT SEXP plr_SPI_cursor_open(SEXP cursor_name_arg,SEXP rsaved_plan, SEXP rargvalues);
+PGDLLEXPORT SEXP plr_SPI_cursor_fetch(SEXP cursor_in,SEXP forward_in, SEXP rows_in);
+PGDLLEXPORT void plr_SPI_cursor_close(SEXP cursor_in);
+PGDLLEXPORT void plr_SPI_cursor_move(SEXP cursor_in, SEXP forward_in, SEXP rows_in);
+PGDLLEXPORT SEXP plr_SPI_lastoid(void);
+PGDLLEXPORT void throw_r_error(const char **msg);
+#if PG_VERSION_NUM >= 110000
+PGDLLEXPORT SEXP plr_SPI_commit(void);
+PGDLLEXPORT SEXP plr_SPI_rollback(void);
+#endif
 
 /* Postgres callable functions useful in conjunction with PL/R */
-extern Datum plr_version(PG_FUNCTION_ARGS);
-extern Datum reload_plr_modules(PG_FUNCTION_ARGS);
-extern Datum install_rcmd(PG_FUNCTION_ARGS);
-extern Datum plr_array_push(PG_FUNCTION_ARGS);
-extern Datum plr_array(PG_FUNCTION_ARGS);
-extern Datum plr_array_accum(PG_FUNCTION_ARGS);
-extern Datum plr_environ(PG_FUNCTION_ARGS);
-extern Datum plr_set_rhome(PG_FUNCTION_ARGS);
-extern Datum plr_unset_rhome(PG_FUNCTION_ARGS);
-extern Datum plr_set_display(PG_FUNCTION_ARGS);
-extern Datum plr_get_raw(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum plr_version(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum reload_plr_modules(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum install_rcmd(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum plr_array_push(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum plr_array(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum plr_array_accum(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum plr_environ(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum plr_set_rhome(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum plr_unset_rhome(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum plr_set_display(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum plr_get_raw(PG_FUNCTION_ARGS);
 
 /* Postgres backend support functions */
 extern void compute_function_hashkey(FunctionCallInfo fcinfo,
@@ -653,7 +704,7 @@ extern plr_function *plr_HashTableLookup(plr_func_hashkey *func_key);
 extern void plr_HashTableInsert(plr_function *function,
 								plr_func_hashkey *func_key);
 extern void plr_HashTableDelete(plr_function *function);
-extern char *get_load_self_ref_cmd(Oid funcid);
+extern char *get_load_self_ref_cmd(Oid langOid);
 extern void perm_fmgr_info(Oid functionId, FmgrInfo *finfo);
 
 #endif   /* PLR_H */

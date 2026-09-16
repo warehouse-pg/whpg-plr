@@ -5,4 +5,12 @@
 # different error message on GP6 & 7
 m/ERROR:  invalid input syntax for.*integer/
 s/ERROR:  invalid input syntax for.*integer/ERROR:  invalid input syntax for integer/
+# GP19 says "column(s) named" where GP7 says "column named" in the
+# distribution-key NOTICE. Normalise so one expected file serves both lines.
+m/NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named/
+s/Using column named/Using column\(s\) named/
+# PL/R names its wrapper closure after the function's OID (PLR<oid>), which
+# differs between clusters, so normalise it.
+m/PLR[0-9]+ <- function/
+s/PLR[0-9]+/PLRnnn/
 -- end_matchsubs

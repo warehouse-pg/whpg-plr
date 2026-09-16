@@ -1,10 +1,11 @@
-\set ECHO all
-CREATE EXTENSION plr;
+-- install extension
+create extension plr;
 
--- FIXME: check_version was removed by the legacy gp plr.
---        Bring it back and handle the upgrade in the next release.
+-- make sure we get the notices
+set client_min_messages to notice;
+
 -- check version
--- SELECT plr_version();
+SELECT plr_version();
 
 -- make typenames available in the global namespace
 select load_r_typenames();
@@ -66,17 +67,17 @@ select rbool('f');
 select rbool(NULL);
 
 
-CREATE OR REPLACE FUNCTION rfloat4(f float4) RETURNS float4 AS $$
-return (as.numeric(f))
+CREATE OR REPLACE FUNCTION rfloat(inout f anyelement, out isnull boolean, out isna boolean, out isnan boolean) AS $$
+  list(as.numeric(f), is.null(f), is.na(f), is.nan(f))
 $$ LANGUAGE plr;
-select rfloat4(1::int4);
-select rfloat4(NULL);
-
-CREATE OR REPLACE FUNCTION rfloat8(f float8) RETURNS float8 AS $$
-return (as.numeric(f))
-$$ LANGUAGE plr;
-select rfloat8(1::float8);
-select rfloat8(NULL);
+select rfloat(1::int4);
+select rfloat(1::float4);
+select rfloat(NULL::float4);
+select rfloat('NaN'::float4);
+select rfloat(1::float8);
+select rfloat(NULL::float8);
+select rfloat('NaN'::float8);
+select rfloat(1); -- numeric
 
 
 --
@@ -148,11 +149,15 @@ select r_median('{1.23,1.31,1.42,1.27}'::_float8);
 CREATE AGGREGATE "median" (sfunc = plr_array_accum, basetype = float8, stype = _float8, finalfunc = r_median);
 select f1, "median"(f2) from foo group by f1 order by f1;
 
---Disabled by legacy gp plr 0f80312e8.
---create or replace function r_gamma(_float8) returns float as 'gamma(arg1)' language 'plr';
---select round(r_gamma('{1.23,1.31,1.42,1.27}'::_float8)::numeric,8);
---CREATE AGGREGATE gamma (sfunc = plr_array_accum, basetype = float8, stype = _float8, finalfunc = r_gamma);
---select f1, round(gamma(f2)::numeric,8) from foo group by f1 order by f1;
+create or replace function r_gamma(_float8) returns float as 'gamma(arg1)' language 'plr';
+select round(r_gamma('{1.23,1.31,1.42,1.27}'::_float8)::numeric,8);
+CREATE AGGREGATE gamma1 (sfunc = plr_array_accum, basetype = float8, stype = _float8, finalfunc = r_gamma);
+-- gamma1 accumulates its input into an array (sfunc = plr_array_accum) and
+-- r_gamma reduces that array to a scalar, so the result depends on the order
+-- values were accumulated in. On an MPP server that order is arbitrary, and
+-- the unordered form returns a different value from run to run. ORDER BY
+-- inside the aggregate makes the accumulation deterministic.
+select f1, round(gamma1(f2 order by f2)::numeric,8) from foo group by f1 order by f1;
 
 --
 -- test returning vectors, arrays, matricies, and dataframes
@@ -202,7 +207,16 @@ select test_dta2();
 
 -- generates expected error
 create or replace function test_dia1() returns int[] as 'as.data.frame(array(letters[1:10], c(2,5)))' language 'plr';
-select test_dia1() as error;
+create or replace function test_dia1_wrap() returns text as $body$
+begin
+  select test_dia1() as error;
+  return 'failed';
+exception
+  when invalid_text_representation then
+    return 'ok';
+end;
+$body$ language plpgsql;
+select test_dia1_wrap();
 
 create or replace function test_dtup() returns setof record as 'data.frame(letters[1:10],1:10)' language 'plr';
 select * from test_dtup() as t(f1 text, f2 int);
@@ -264,9 +278,12 @@ select test_spi_prep('select oid, typname from pg_type where typname = $1 or typ
 create or replace function test_spi_execp(text, text, text) returns setof record as 'pg.spi.execp(pg.reval(arg1), list(arg2,arg3))' language 'plr';
 select * from test_spi_execp('sp','oid','text') as t(typeid oid, typename name);
 
---Disabled by legacy gp plr 0f80312e8. Due to the distributed nature of whpg, this is probably not supported.
---create or replace function test_spi_lastoid(text) returns text as 'pg.spi.exec(arg1); pg.spi.lastoid()/pg.spi.lastoid()' language 'plr';
---select test_spi_lastoid('insert into foo values(10,''cat3'',3.333)') as "ONE";
+create or replace function test_spi_lastoid(text) returns text as $$
+  version_12plus <- pg.spi.exec("select current_setting('server_version_num')::integer < 120000")
+  pg.spi.exec(arg1)
+  ifelse(version_12plus, pg.spi.lastoid()/pg.spi.lastoid(), 1)
+$$ language 'plr';
+select test_spi_lastoid('insert into foo values(10,''cat3'',3.333)') as "ONE";
 
 --
 -- test NULL handling
@@ -387,11 +404,10 @@ select arr3d('{{{111,112},{121,122},{131,132}},{{211,212},{221,222},{231,232}}}'
 -- test statement level triggers and verify all arguments come
 -- across correctly
 --
---create or replace function foonotice() returns trigger as '
---msg <- paste(pg.tg.name,pg.tg.relname,pg.tg.when,pg.tg.level,pg.tg.op,pg.tg.args[1],pg.tg.args[2])
---pg.thrownotice(msg)
---return(NULL)
---' language plr;
+create or replace function foonotice() returns trigger as '
+msg <- paste(pg.tg.name,pg.tg.relname,pg.tg.when,pg.tg.level,pg.tg.op,pg.tg.args[1],pg.tg.args[2])
+pg.thrownotice(msg)
+' language plr;
 
 --create trigger footrig after insert or update or delete on foo for each row execute procedure foonotice();
 --select count(*) from foo;
@@ -442,7 +458,7 @@ returns setof record as '
  return (arg1)
 ' language 'plr';
 
-select * from restore_df((select test_serialize('select oid, typname from pg_type where typname in (''oid'',''name'',''int4'')'))) as t(oid oid, typname name);
+select * from restore_df((select test_serialize('select oid, typname from pg_type where typname in (''oid'',''name'',''int4'')'))) as t(oid oid, typname name) order by oid;
 
 --Test WINDOW functions
 -- create test table
@@ -465,20 +481,18 @@ RETURNS float8 AS
 $BODY$
   slope <- NA
   y <- farg1
-  x <- farg2 
+  x <- farg2
   if (fnumrows==9) try (slope <- lm(y ~ x)$coefficients[2])
   return(slope)
 $BODY$
 LANGUAGE plr WINDOW;
 
--- Disabled from WHPG7, error has been raised in PG12:
--- WINDOW_SEEK_CURRENT is not supported for WinGetFuncArgInFrame
--- SELECT *, round((r_regr_slope(eps, lag_eps) OVER w)::numeric,6) AS slope_R
--- FROM (SELECT firm, fyear, eps,
---   lag(eps) OVER (ORDER BY firm, fyear) AS lag_eps
--- FROM test_data) AS a
--- WHERE eps IS NOT NULL
--- WINDOW w AS (ORDER BY firm, fyear ROWS 8 PRECEDING);
+SELECT *, round((r_regr_slope(eps, lag_eps) OVER w)::numeric,6) AS slope_R
+FROM (SELECT firm, fyear, eps,
+  lag(eps) OVER (ORDER BY firm, fyear) AS lag_eps
+FROM test_data) AS a
+WHERE eps IS NOT NULL
+WINDOW w AS (ORDER BY firm, fyear ROWS 8 PRECEDING);
 
 CREATE OR REPLACE FUNCTION rlargeint8out(n int) RETURNS int8[] AS $$
 matrix(2, 1, n)
@@ -494,5 +508,32 @@ SELECT routfloat4(10);
 SELECT count(rlargeint8out(15000));
 SELECT count(routfloat4(15000));
 
-create or replace function test_return_numeric() returns numeric[] as 'array(1:10,c(2,5))' language 'plr';
-SELECT test_return_numeric();
+CREATE table tbl(val integer);
+
+CREATE OR REPLACE FUNCTION test_create_procedure() RETURNS void
+  AS
+$BODY$
+  version_11plus  <- pg.spi.exec("select current_setting('server_version_num')::integer >= 110000;")
+  if(version_11plus[[1]])
+  {
+    pg.spi.exec("
+      CREATE OR REPLACE PROCEDURE insert_data(a int, b int)
+        AS
+      $$
+        pg.spi.exec('INSERT INTO tbl VALUES (1);')
+        pg.spi.exec('INSERT INTO tbl VALUES (2);')
+      $$ LANGUAGE plr;
+      ")
+    pg.spi.exec("CALL insert_data(1, 2);")
+  }
+  else
+  {
+    pg.spi.exec("INSERT INTO tbl VALUES (1);")
+    pg.spi.exec("INSERT INTO tbl VALUES (2);")
+  }
+$BODY$
+LANGUAGE plr;
+
+SELECT test_create_procedure();
+
+SELECT * FROM tbl;

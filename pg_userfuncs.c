@@ -2,7 +2,7 @@
  * PL/R - PostgreSQL support for R as a
  *	      procedural language (PL)
  *
- * Copyright (c) 2003-2015 by Joseph E. Conway
+ * Copyright (c) 2003 by Joseph E. Conway
  * ALL RIGHTS RESERVED
  * 
  * Joe Conway <mail@joeconway.com>
@@ -322,13 +322,12 @@ plr_environ(PG_FUNCTION_ARGS)
 	 * Check to make sure we have a reasonable tuple descriptor
 	 */
 	if (tupdesc->natts != 2 ||
-#if GP_VERSION_NUM >= 70000
-		TupleDescAttr(tupdesc, 0)->atttypid != TEXTOID ||
-		TupleDescAttr(tupdesc, 1)->atttypid != TEXTOID)
-#else
-		tupdesc->attrs[0]->atttypid != TEXTOID ||
-		tupdesc->attrs[1]->atttypid != TEXTOID)
-#endif
+		/*
+		 * Upstream REL8_4_8_7 indexes attribute 0 twice here; the second test
+		 * is meant to check the second attribute. Keep the fork's indices.
+		 */
+		TUPLE_DESC_ATTR(tupdesc,0)->atttypid != TEXTOID ||
+		TUPLE_DESC_ATTR(tupdesc,1)->atttypid != TEXTOID)
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
 				 errmsg("query-specified return tuple and "
@@ -532,8 +531,7 @@ plr_get_raw(PG_FUNCTION_ARGS)
 	 * Need to construct a call to
 	 * unserialize(rval)
 	 */
-	PROTECT(t = s = allocList(2));
-	SET_TYPEOF(s, LANGSXP);
+	SET_ALLOCLANG_SIZE(2, s, t);
 	SETCAR(t, install("unserialize")); t = CDR(t);
 	SETCAR(t, obj);
 

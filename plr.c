@@ -2,7 +2,7 @@
  * PL/R - PostgreSQL support for R as a
  *	      procedural language (PL)
  *
- * Copyright (c) 2003-2015 by Joseph E. Conway
+ * Copyright (c) 2003 by Joseph E. Conway
  * ALL RIGHTS RESERVED
  * 
  * Joe Conway <mail@joeconway.com>
@@ -35,6 +35,14 @@
 PG_MODULE_MAGIC;
 
 /*
+ * Structure for wrapping R_ParseVector call into R_TopLevelExec
+ */
+typedef struct {
+	SEXP	in, out;
+	ParseStatus status;
+} ProtectedParseData;
+
+/*
  * Global data
  */
 MemoryContext plr_caller_context;
@@ -47,8 +55,6 @@ static bool	plr_be_init_done = false;
 
 /* namespace OID for the PL/R language handler function */
 static Oid plr_nspOid = InvalidOid;
-
-int R_SignalHandlers = 1;  /* Exposed in R_interface.h */
 
 /*
  * defines
@@ -68,9 +74,15 @@ int R_SignalHandlers = 1;  /* Exposed in R_interface.h */
 			"}"
 #define OPTIONS_THROWRERROR_CMD \
 			"options(error = expression(pg.throwrerror(geterrmessage())))"
+#define THROWLOG_CMD \
+			"pg.throwlog <-function(msg) " \
+			"{.C(\"throw_pg_log\", as.integer(" CppAsString2(LOG) "), as.character(msg));invisible()}"
+#define THROWWARNING_CMD \
+			"pg.throwwarning <-function(msg) " \
+			"{.C(\"throw_pg_log\", as.integer(" CppAsString2(WARNING) "), as.character(msg));invisible()}"
 #define THROWNOTICE_CMD \
 			"pg.thrownotice <-function(msg) " \
-			"{.C(\"throw_pg_notice\", as.character(msg))}"
+			"{.C(\"throw_pg_log\", as.integer(" CppAsString2(NOTICE) "), as.character(msg));invisible()}"
 #define THROWERROR_CMD \
 			"pg.throwerror <-function(msg) " \
 			"{stop(msg, call. = FALSE)}"
@@ -102,9 +114,19 @@ int R_SignalHandlers = 1;  /* Exposed in R_interface.h */
 #define SPI_CURSOR_CLOSE_CMD \
 			"pg.spi.cursor_close<-function(cursor) " \
 			"{.Call(\"plr_SPI_cursor_close\",cursor)}"
+#if CATALOG_VERSION_NO < 201811201
 #define SPI_LASTOID_CMD \
 			"pg.spi.lastoid <-function() " \
 			"{.Call(\"plr_SPI_lastoid\")}"
+#endif
+#if PG_VERSION_NUM >= 110000
+#define SPI_COMMIT_CMD \
+			"pg.spi.commit <-function() " \
+			"{.Call(\"plr_SPI_commit\")}"
+#define SPI_ROLLBACK_CMD \
+			"pg.spi.rollback <-function() " \
+			"{.Call(\"plr_SPI_rollback\")}"
+#endif
 #define SPI_DBDRIVER_CMD \
 			"dbDriver <-function(db_name)\n" \
 			"{return(NA)}"
@@ -170,21 +192,13 @@ int R_SignalHandlers = 1;  /* Exposed in R_interface.h */
 	argnull[arg_idx]
 #endif
 
-/*
- * Structure for wrapping R_ParseVector call into R_TopLevelExec
- */
-typedef struct {
-	SEXP	in, out;
-	ParseStatus status;
-} ProtectedParseData;
-
 
 /*
  * static declarations
  */
 static void plr_atexit(void);
-static void plr_load_builtins(Oid funcid);
-static void plr_init_all(Oid funcid);
+static void plr_load_builtins(Oid langOid);
+static void plr_init_all(Oid langOid);
 static Datum plr_trigger_handler(PG_FUNCTION_ARGS);
 static Datum plr_func_handler(PG_FUNCTION_ARGS);
 static plr_function *compile_plr_function(FunctionCallInfo fcinfo);
@@ -193,17 +207,27 @@ static plr_function *do_compile(FunctionCallInfo fcinfo,
 								plr_func_hashkey *hashkey);
 static void plr_protected_parse(void* data);
 static SEXP plr_parse_func_body(const char *body);
-#if GP_VERSION_NUM >= 70000
-static SEXP plr_convertargs(plr_function *function, NullableDatum *args, FunctionCallInfo fcinfo);
+#if (PG_VERSION_NUM >= 120000)
+static SEXP plr_convertargs(plr_function *function, NullableDatum *args, FunctionCallInfo fcinfo, SEXP rho);
 #else
-static SEXP plr_convertargs(plr_function *function, Datum *arg, bool *argnull, FunctionCallInfo fcinfo);
+static SEXP plr_convertargs(plr_function *function, Datum *arg, bool *argnull, FunctionCallInfo fcinfo, SEXP rho);
 #endif
 static void plr_error_callback(void *arg);
-static Oid getNamespaceOidFromFunctionOid(Oid fnOid);
+static void remove_carriage_return(char* p);
+static Oid getNamespaceOidFromLanguageOid(Oid langOid);
 static bool haveModulesTable(Oid nspOid);
 static char *getModulesSql(Oid nspOid);
 #ifdef HAVE_WINDOW_FUNCTIONS
-static void WinGetFrameData(WindowObject winobj, int argno, Datum *dvalues, bool *isnull, int *numels, bool *has_nulls);
+// See full definition in src/backend/executor/nodeWindowAgg.c
+typedef struct WindowObjectData
+{
+	NodeTag		type;
+	WindowAggState *winstate;	/* parent WindowAggState */
+} WindowObjectData;
+static const char PLR_WINDOW_FRAME_NAME[] = "plr_window_frame";
+#define PLR_WINDOW_ENV_NAME_MAX_LENGTH 30
+static const char PLR_WINDOW_ENV_PATTERN[] = "window_env_%p";
+static bool plr_is_unbound_frame(WindowObject winobj);
 #endif
 static void plr_resolve_polymorphic_argtypes(int numargs,
 											 Oid *argtypes, char *argmodes,
@@ -211,8 +235,13 @@ static void plr_resolve_polymorphic_argtypes(int numargs,
 											 const char *proname);
 
 /*
- * plr_call_handler -	This is the only visible function
- *						of the PL interpreter. The PostgreSQL
+There are three externally visible pieces to plr: plr_call_handler,
+plr_inline_handler, and plr_validator.
+*/
+
+
+/*
+ * plr_call_handler -	The PostgreSQL
  *						function manager and trigger manager
  *						call this function for execution of
  *						PL/R procedures.
@@ -222,18 +251,50 @@ PG_FUNCTION_INFO_V1(plr_call_handler);
 Datum
 plr_call_handler(PG_FUNCTION_ARGS)
 {
+
+#if PG_VERSION_NUM >= 110000
+	bool		nonatomic;
+#endif
 	Datum			retval;
+
+#if PG_VERSION_NUM >= 110000
+	nonatomic = fcinfo->context &&
+		IsA(fcinfo->context, CallContext) &&
+		!castNode(CallContext, fcinfo->context)->atomic;
+#endif
 
 	/* save caller's context */
 	plr_caller_context = CurrentMemoryContext;
 
+#if PG_VERSION_NUM >= 110000
+	if (SPI_connect_ext(nonatomic ? SPI_OPT_NONATOMIC : 0) != SPI_OK_CONNECT)
+#else
 	if (SPI_connect() != SPI_OK_CONNECT)
+#endif
 		elog(ERROR, "SPI_connect failed");
 	plr_SPI_context = CurrentMemoryContext;
 	MemoryContextSwitchTo(plr_caller_context);
 
 	/* initialize R if needed */
-	plr_init_all(fcinfo->flinfo->fn_oid);
+	if (!plr_be_init_done) {
+		HeapTuple			procedureTuple;
+		Form_pg_proc		procedureStruct;
+		Oid					language;
+		/* get the pg_proc entry */
+		procedureTuple = SearchSysCache(PROCOID,
+			ObjectIdGetDatum(fcinfo->flinfo->fn_oid),
+			0, 0, 0);
+		if (!HeapTupleIsValid(procedureTuple))
+			/* internal error */
+			elog(ERROR, "cache lookup failed for function %u", fcinfo->flinfo->fn_oid);
+		procedureStruct = (Form_pg_proc)GETSTRUCT(procedureTuple);
+
+		/* now get the pg_language entry */
+		language = procedureStruct->prolang;
+		ReleaseSysCache(procedureTuple);
+
+		plr_init_all(language);
+	}
 
 	if (CALLED_AS_TRIGGER(fcinfo))
 		retval = plr_trigger_handler(fcinfo);
@@ -243,11 +304,83 @@ plr_call_handler(PG_FUNCTION_ARGS)
 	return retval;
 }
 
+PG_FUNCTION_INFO_V1(plr_inline_handler);
+
+Datum
+plr_inline_handler(PG_FUNCTION_ARGS)
+{
+	const InlineCodeBlock * const icb = (InlineCodeBlock *)PG_GETARG_POINTER(0);
+	char * src = icb->source_text;
+	Oid langOid = icb->langOid;
+
+	/* initialize R if needed */
+	/* save caller's context */
+	plr_caller_context = CurrentMemoryContext;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	plr_SPI_context = CurrentMemoryContext;
+	MemoryContextSwitchTo(plr_caller_context);
+
+	plr_init_all(langOid);
+
+	remove_carriage_return(src);
+	load_r_cmd(src);
+
+	if (SPI_finish() != SPI_OK_FINISH)
+		elog(ERROR, "SPI_finish failed");
+	PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(plr_validator);
+
+Datum
+plr_validator(PG_FUNCTION_ARGS)
+{
+	Datum			prosrcdatum;
+	HeapTuple		procTup;
+	bool			isnull;
+	char		   *proc_source,
+				   *body;
+	Oid funcoid = PG_GETARG_OID(0);
+
+	if (!check_function_bodies || !CheckFunctionValidatorAccess(fcinfo->flinfo->fn_oid, funcoid))
+		PG_RETURN_VOID();
+
+	procTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcoid));
+	if (!HeapTupleIsValid(procTup))
+		elog(ERROR, "cache lookup failed for function %u", funcoid);
+
+	/* Add user's function definition to proc body */
+	prosrcdatum = SysCacheGetAttr(PROCOID, procTup,
+		Anum_pg_proc_prosrc, &isnull);
+	if (isnull)
+		elog(ERROR, "null prosrc");
+	proc_source = DatumGetCString(DirectFunctionCall1(textout, prosrcdatum));
+	ReleaseSysCache(procTup);
+
+	remove_carriage_return(proc_source);
+
+	if (!plr_pm_init_done)
+		plr_init();
+
+	body = (char *) palloc(strlen(proc_source) + 3); /* {}\x00 */
+	if (NULL == body)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of memory")));
+	sprintf(body, "{%s}", proc_source);
+	pfree(proc_source);
+	plr_parse_func_body(body);
+	pfree(body);
+
+	PG_RETURN_VOID();
+}
+
 void
 load_r_cmd(const char *cmd)
 {
-	SEXP		cmdSexp,
-				cmdexpr;
+	SEXP		cmdexpr;
 	int			i,
 				status;
 
@@ -259,22 +392,7 @@ load_r_cmd(const char *cmd)
 	if (!plr_pm_init_done)
 		plr_init();
 
-	PROTECT(cmdSexp = NEW_CHARACTER(1));
-	SET_STRING_ELT(cmdSexp, 0, COPY_TO_USER_STRING(cmd));
-	PROTECT(cmdexpr = R_PARSEVECTOR(cmdSexp, -1, &status));
-	if (status != PARSE_OK) {
-		UNPROTECT(2);
-		if (last_R_error_msg)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_EXCEPTION),
-					 errmsg("R interpreter parse error"),
-					 errdetail("%s", last_R_error_msg)));
-		else
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_EXCEPTION),
-					 errmsg("R interpreter parse error"),
-					 errdetail("R parse error caught in \"%s\".", cmd)));
-	}
+	PROTECT(cmdexpr = plr_parse_func_body(cmd));
 
 	/* Loop is needed here as EXPSEXP may be of length > 1 */
 	for(i = 0; i < length(cmdexpr); i++)
@@ -282,6 +400,7 @@ load_r_cmd(const char *cmd)
 		R_tryEval(VECTOR_ELT(cmdexpr, i), R_GlobalEnv, &status);
 		if(status != 0)
 		{
+			UNPROTECT(1);
 			if (last_R_error_msg)
 				ereport(ERROR,
 						(errcode(ERRCODE_DATA_EXCEPTION),
@@ -296,7 +415,7 @@ load_r_cmd(const char *cmd)
 		}
 	}
 
-	UNPROTECT(2);
+	UNPROTECT(1);
 }
 
 /*
@@ -364,8 +483,12 @@ plr_init(void)
 	if (plr_pm_init_done)
 		return;
 
+#ifdef WIN32
+	r_home = get_R_HOME();
+#else
 	/* refuse to start if R_HOME is not defined */
 	r_home = getenv("R_HOME");
+#endif
 	if (r_home == NULL)
 	{
 		size_t		rh_len = strlen(R_HOME_DEFAULT);
@@ -409,6 +532,7 @@ plr_init(void)
 	 * When initialization fails, R currently exits. Check the return
 	 * value anyway in case this ever gets fixed
 	 */
+	
 	if (!Rf_initEmbeddedR(rargc, rargv))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -447,11 +571,30 @@ plr_init(void)
 	plr_pm_init_done = true;
 }
 
+#ifdef HAVE_WINDOW_FUNCTIONS
+/*
+ * plr_is_unbound_frame - return true if window function frame is unbound, i.e. whole partition
+ */
+static bool
+plr_is_unbound_frame(WindowObject winobj)
+{
+	WindowAgg*			node		 = (WindowAgg *)winobj->winstate->ss.ps.plan;
+	int					frameOptions = winobj->winstate->frameOptions;
+	static const int	unbound_mask = FRAMEOPTION_START_UNBOUNDED_PRECEDING | FRAMEOPTION_END_UNBOUNDED_FOLLOWING;
+
+	return
+#if PG_VERSION_NUM >= 110000
+		0 == (frameOptions & (FRAMEOPTION_GROUPS | FRAMEOPTION_EXCLUDE_CURRENT_ROW | FRAMEOPTION_EXCLUDE_GROUP | FRAMEOPTION_EXCLUDE_TIES)) &&
+#endif
+		((0 == node->ordNumCols && frameOptions & FRAMEOPTION_RANGE) || unbound_mask == (frameOptions & unbound_mask));
+}
+#endif
+
 /*
  * plr_load_builtins() - load "builtin" PL/R functions into R interpreter
  */
 static void
-plr_load_builtins(Oid funcid)
+plr_load_builtins(Oid langOid)
 {
 	int			j;
 	char	   *cmd;
@@ -463,7 +606,9 @@ plr_load_builtins(Oid funcid)
 		/* set up the postgres error handler in R */
 		THROWRERROR_CMD,
 		OPTIONS_THROWRERROR_CMD,
+		THROWLOG_CMD,
 		THROWNOTICE_CMD,
+		THROWWARNING_CMD,
 		THROWERROR_CMD,
 		OPTIONS_THROWWARN_CMD,
 
@@ -477,7 +622,13 @@ plr_load_builtins(Oid funcid)
 		SPI_CURSOR_FETCH_CMD,
 		SPI_CURSOR_MOVE_CMD,
 		SPI_CURSOR_CLOSE_CMD,
+#if CATALOG_VERSION_NO < 201811201
 		SPI_LASTOID_CMD,
+#endif
+#if PG_VERSION_NUM >= 110000
+		SPI_COMMIT_CMD,
+		SPI_ROLLBACK_CMD,
+#endif
 		SPI_DBDRIVER_CMD,
 		SPI_DBCONN_CMD,
 		SPI_DBSENDQUERY_CMD,
@@ -503,7 +654,7 @@ plr_load_builtins(Oid funcid)
 	load_r_cmd(cmds[0]);
 
 	/* next load the plr library into R */
-	load_r_cmd(get_load_self_ref_cmd(funcid));
+	load_r_cmd(get_load_self_ref_cmd(langOid));
 
 	/*
 	 * run the rest of the R bootstrap commands, being careful to start
@@ -589,7 +740,7 @@ plr_load_modules(void)
 }
 
 static void
-plr_init_all(Oid funcid)
+plr_init_all(Oid langOid)
 {
 	MemoryContext		oldcontext;
 
@@ -607,10 +758,10 @@ plr_init_all(Oid funcid)
 	if (!plr_be_init_done)
 	{
 		/* load "builtin" R functions */
-		plr_load_builtins(funcid);
+		plr_load_builtins(langOid);
 
 		/* obtain & store namespace OID of PL/R language handler */
-		plr_nspOid = getNamespaceOidFromFunctionOid(funcid);
+		plr_nspOid = getNamespaceOidFromLanguageOid(langOid);
 
 		/* try to load procedures from plr_modules */
 		plr_load_modules();
@@ -630,11 +781,11 @@ plr_trigger_handler(PG_FUNCTION_ARGS)
 	SEXP			rargs;
 	SEXP			rvalue;
 	Datum			retval;
-#if GP_VERSION_NUM >= 70000
-	NullableDatum   nullablearg[FUNC_MAX_ARGS];
+#if (PG_VERSION_NUM >= 120000)
+	NullableDatum  args[FUNC_MAX_ARGS];
 #else
-	Datum			arg[FUNC_MAX_ARGS];
-	bool			argnull[FUNC_MAX_ARGS];
+	Datum arg[FUNC_MAX_ARGS];
+    bool argnull[FUNC_MAX_ARGS];
 #endif
 	TriggerData	   *trigdata = (TriggerData *) fcinfo->context;
 	TupleDesc		tupdesc = trigdata->tg_relation->rd_att;
@@ -666,61 +817,56 @@ plr_trigger_handler(PG_FUNCTION_ARGS)
 	 * are mostly hardwired in advance
 	 */
 	/* first is trigger name */
-	ARG(0) = DirectFunctionCall1(textin,
-				 CStringGetDatum(trigdata->tg_trigger->tgname));
-	ARGNULL(0) = false;
+	SET_ARG(DirectFunctionCall1(textin,
+				 CStringGetDatum(trigdata->tg_trigger->tgname)),false,0);
 
 	/* second is trigger relation oid */
-	ARG(1) = ObjectIdGetDatum(trigdata->tg_relation->rd_id);
-	ARGNULL(1) = false;
+	SET_ARG(ObjectIdGetDatum(trigdata->tg_relation->rd_id),false,1);
 
 	/* third is trigger relation name */
-	ARG(2) = DirectFunctionCall1(textin,
-				 CStringGetDatum(get_rel_name(trigdata->tg_relation->rd_id)));
-	ARGNULL(2) = false;
+	SET_ARG(DirectFunctionCall1(textin,
+				 CStringGetDatum(get_rel_name(trigdata->tg_relation->rd_id))),false,2);
 
 	/* fourth is when trigger fired, i.e. BEFORE or AFTER */
 	if (TRIGGER_FIRED_BEFORE(trigdata->tg_event))
-		ARG(3) = DirectFunctionCall1(textin,
-				 CStringGetDatum("BEFORE"));
+		SET_ARG(DirectFunctionCall1(textin,
+				 CStringGetDatum("BEFORE")),false,3);
 	else if (TRIGGER_FIRED_AFTER(trigdata->tg_event))
-		ARG(3) = DirectFunctionCall1(textin,
-				 CStringGetDatum("AFTER"));
+		SET_ARG(DirectFunctionCall1(textin,
+				 CStringGetDatum("AFTER")),false,3);
 	else
 		/* internal error */
 		elog(ERROR, "unrecognized tg_event");
-	ARGNULL(3) = false;
+
 
 	/*
 	 * fifth is level trigger fired, i.e. ROW or STATEMENT
 	 * sixth is operation that fired trigger, i.e. INSERT, UPDATE, or DELETE
-	 * seventh is NEW, eigth is OLD
+	 * seventh is NEW, eighth is OLD
 	 */
 	if (TRIGGER_FIRED_FOR_STATEMENT(trigdata->tg_event))
 	{
-		ARG(4) = DirectFunctionCall1(textin,
-				 CStringGetDatum("STATEMENT"));
+		SET_ARG(DirectFunctionCall1(textin,
+				 CStringGetDatum("STATEMENT")),false,4);
 
 		if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
-			ARG(5) = DirectFunctionCall1(textin, CStringGetDatum("INSERT"));
+			SET_ARG(DirectFunctionCall1(textin, CStringGetDatum("INSERT")),false,5);
 		else if (TRIGGER_FIRED_BY_DELETE(trigdata->tg_event))
-			ARG(5) = DirectFunctionCall1(textin, CStringGetDatum("DELETE"));
+			SET_ARG(DirectFunctionCall1(textin, CStringGetDatum("DELETE")),false,5);
 		else if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
-			ARG(5) = DirectFunctionCall1(textin, CStringGetDatum("UPDATE"));
+			SET_ARG(DirectFunctionCall1(textin, CStringGetDatum("UPDATE")),false,5);
 		else
 			/* internal error */
 			elog(ERROR, "unrecognized tg_event");
 
-		ARG(6) = (Datum) 0;
-		ARGNULL(6) = true;
+		SET_ARG((Datum) 0,true,6);
+		SET_ARG((Datum) 0,true,7);
 
-		ARG(7) = (Datum) 0;
-		ARGNULL(7) = true;
 	}
 	else if (TRIGGER_FIRED_FOR_ROW(trigdata->tg_event))
 	{
-		ARG(4) = DirectFunctionCall1(textin,
-				 CStringGetDatum("ROW"));
+		SET_ARG(DirectFunctionCall1(textin,
+				 CStringGetDatum("ROW")),false,4);
 
 		if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
 			SET_INSERT_ARGS_567;
@@ -736,8 +882,6 @@ plr_trigger_handler(PG_FUNCTION_ARGS)
 		/* internal error */
 		elog(ERROR, "unrecognized tg_event");
 
-	ARGNULL(4) = false;
-	ARGNULL(5) = false;
 
 	/*
 	 * finally, ninth argument is a text array of trigger arguments
@@ -751,8 +895,7 @@ plr_trigger_handler(PG_FUNCTION_ARGS)
 	array = construct_md_array(dvalues, NULL, ndims, dims, lbs,
 								TEXTOID, -1, false, 'i');
 
-	ARG(8) = PointerGetDatum(array);
-	ARGNULL(8) = false;
+	SET_ARG(PointerGetDatum(array),false,8);
 
 	/*
 	 * All done building args; from this point it is just like
@@ -762,14 +905,13 @@ plr_trigger_handler(PG_FUNCTION_ARGS)
 	PROTECT(fun = function->fun);
 
 	/* Convert all call arguments */
-#if GP_VERSION_NUM >= 70000
-	PROTECT(rargs = plr_convertargs(function, nullablearg, fcinfo));
+#if (PG_VERSION_NUM >= 120000)
+	PROTECT(rargs = plr_convertargs(function, args, fcinfo, R_NilValue));
 #else
-	PROTECT(rargs = plr_convertargs(function, arg, argnull, fcinfo));
+	PROTECT(rargs = plr_convertargs(function, arg, argnull, fcinfo, R_NilValue));
 #endif
-
 	/* Call the R function */
-	PROTECT(rvalue = call_r_func(fun, rargs));
+	PROTECT(rvalue = call_r_func(fun, rargs, R_GlobalEnv));
 
 	/*
 	 * Convert the return value from an R object to a Datum.
@@ -790,9 +932,16 @@ plr_func_handler(PG_FUNCTION_ARGS)
 {
 	plr_function  *function;
 	SEXP			fun;
+	SEXP			env = R_GlobalEnv;
 	SEXP			rargs;
 	SEXP			rvalue;
 	Datum			retval;
+#ifdef HAVE_WINDOW_FUNCTIONS
+	WindowObject	winobj = NULL;   	//set to NULL to silence compiler warnings
+	char			internal_env[PLR_WINDOW_ENV_NAME_MAX_LENGTH];
+	int64			current_row = -1;
+	int				check_err;
+#endif
 	ERRORCONTEXTCALLBACK;
 
 	/* Find or compile the function */
@@ -803,15 +952,45 @@ plr_func_handler(PG_FUNCTION_ARGS)
 
 	PROTECT(fun = function->fun);
 
-	/* Convert all call arguments */
-#if GP_VERSION_NUM >= 70000
-	PROTECT(rargs = plr_convertargs(function, fcinfo->args, fcinfo));
-#else
-	PROTECT(rargs = plr_convertargs(function, fcinfo->arg, fcinfo->argnull, fcinfo));
+#ifdef HAVE_WINDOW_FUNCTIONS
+	if (function->iswindow)
+	{
+		winobj = PG_WINDOW_OBJECT();
+		current_row = WinGetCurrentPosition(winobj);
+
+		sprintf(internal_env, PLR_WINDOW_ENV_PATTERN, winobj);
+		if (0 == current_row)
+		{
+			env = R_tryEval(lang2(install("new.env"), R_GlobalEnv), R_GlobalEnv, &check_err);
+			if (check_err)
+				elog(ERROR, "Failed to create new environment \"%s\" for window function calls.", internal_env);
+			defineVar(install(internal_env), env, R_GlobalEnv);
+		}
+		else
+		{
+			env = FINDVAR(install(internal_env), R_GlobalEnv);
+			if (R_UnboundValue == env)
+				elog(ERROR, "%s window frame environment cannot be found in R_GlobalEnv", internal_env);
+		}
+	}
 #endif
 
+	/* Convert all call arguments */
+#if (PG_VERSION_NUM >= 120000)
+	PROTECT(rargs = plr_convertargs(function, fcinfo->args, fcinfo, env));
+#else
+	PROTECT(rargs = plr_convertargs(function, fcinfo->arg, fcinfo->argnull,  fcinfo, env));
+
+#endif
 	/* Call the R function */
-	PROTECT(rvalue = call_r_func(fun, rargs));
+	PROTECT(rvalue = call_r_func(fun, rargs, env));
+
+#ifdef HAVE_WINDOW_FUNCTIONS
+	/* We should remove window_env_XXX environment along with frame data list after last call */
+	if (function->iswindow && plr_is_unbound_frame(winobj)
+		&& WinGetPartitionRowCount(winobj) == current_row + 1)
+		R_tryEval(lang2(install("rm"), install(internal_env)), R_GlobalEnv, &check_err);
+#endif
 
 	/*
 	 * Convert the return value from an R object to a Datum.
@@ -974,7 +1153,9 @@ do_compile(FunctionCallInfo fcinfo,
 	StringInfo				proc_internal_args = makeStringInfo();
 	char				   *proc_source;
 	MemoryContext			oldcontext;
-	char				   *p;
+	Oid						oid; // FIXME same as result_typid ???
+	TupleDesc				tupdesc;
+	TypeFuncClass			tfc;
 
 	/* grab the function name */
 	proname = NameStr(procStruct->proname);
@@ -1007,8 +1188,7 @@ do_compile(FunctionCallInfo fcinfo,
 	function->fn_tid = procTup->t_self;
 
 #ifdef HAVE_WINDOW_FUNCTIONS
-	/* Flag for window functions */
-#if GP_VERSION_NUM >= 70000
+#if PG_VERSION_NUM >= 110000
 	function->iswindow = (procStruct->prokind == PROKIND_WINDOW);
 #else
 	function->iswindow = procStruct->proiswindow;
@@ -1042,15 +1222,53 @@ do_compile(FunctionCallInfo fcinfo,
 	else
 		result_typid = procStruct->prorettype;
 
-	/*
-	 * Get the required information for input conversion of the
-	 * return value.
-	 */
+	tfc = get_call_result_type(fcinfo, &oid, &tupdesc);
+	switch (tfc)
+	{
+		case TYPEFUNC_SCALAR:
+			function->result_natts = 1;
+			break;
+		case TYPEFUNC_COMPOSITE:
+			function->result_natts = tupdesc->natts;
+			break;
+		case TYPEFUNC_OTHER: // trigger
+			function->result_natts = 0;
+			break;
+		default:
+			elog(ERROR, "unknown function type %u", tfc);
+	}
+
+	if (function->result_natts > 0)
+	{
+		function->result_fld_typid = (Oid *)
+			palloc0(function->result_natts * sizeof(Oid));
+		function->result_fld_elem_typid = (Oid *)
+			palloc0(function->result_natts * sizeof(Oid));
+		function->result_fld_elem_in_func = (FmgrInfo *)
+			palloc0(function->result_natts * sizeof(FmgrInfo));
+		function->result_fld_elem_typlen = (int16 *)
+			palloc0(function->result_natts * sizeof(int));
+		function->result_fld_elem_typbyval = (bool *)
+			palloc0(function->result_natts * sizeof(bool));
+		function->result_fld_elem_typalign = (char *)
+			palloc0(function->result_natts * sizeof(char));
+	}
+
 	if (!is_trigger)
 	{
-		function->result_typid = result_typid;
+		int			i, j;
+		bool		forValidator = false;
+		int			numargs;
+		Oid		   *argtypes;
+		char	  **argnames;
+		char	   *argmodes;
+
+		/*
+		 * Get the required information for input conversion of the
+		 * return value.
+		 */
 		typeTup = SearchSysCache(TYPEOID,
-								 ObjectIdGetDatum(function->result_typid),
+								 ObjectIdGetDatum(result_typid),
 								 0, 0, 0);
 		if (!HeapTupleIsValid(typeTup))
 		{
@@ -1088,125 +1306,37 @@ do_compile(FunctionCallInfo fcinfo,
 			}
 		}
 
-		if (typeStruct->typrelid != InvalidOid ||
-			procStruct->prorettype == RECORDOID)
-			function->result_istuple = true;
-
-		perm_fmgr_info(typeStruct->typinput, &(function->result_in_func));
-
-		if (function->result_istuple)
+		for (i = 0; i < function->result_natts; i++)
 		{
-			int16			typlen;
-			bool			typbyval;
-			char			typdelim;
-			Oid				typinput,
-							typelem;
-			FmgrInfo		inputproc;
-			char			typalign;
-			TupleDesc		tupdesc;
-			int				i;
-			ReturnSetInfo  *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-			
-			/* check to see if caller supports us returning a tuplestore */
-			if (!rsinfo || !(rsinfo->allowedModes & SFRM_Materialize) || rsinfo->expectedDesc == NULL)
-				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR),
-				 		errmsg("materialize mode required, but it is not "
-								"allowed in this context")));
+			if (TYPEFUNC_COMPOSITE == tfc)
+				function->result_fld_typid[i] = TUPLE_DESC_ATTR(tupdesc, i)->atttypid;
+			else
+				function->result_fld_typid[i] = result_typid;
+			function->result_fld_elem_typid[i] = get_element_type(function->result_fld_typid[i]);
+			if (InvalidOid == function->result_fld_elem_typid[i])
+				function->result_fld_elem_typid[i] = function->result_fld_typid[i];
+			if (OidIsValid(function->result_fld_elem_typid[i]))
+			{
+				char			typdelim;
+				Oid				typinput, typelem;
 
-			tupdesc = rsinfo->expectedDesc;
-			function->result_natts = tupdesc->natts;
-			
-			function->result_fld_elem_typid = (Oid *)
-											palloc0(function->result_natts * sizeof(Oid));
-			function->result_fld_elem_in_func = (FmgrInfo *)
-											palloc0(function->result_natts * sizeof(FmgrInfo));
-			function->result_fld_elem_typlen = (int *)
-											palloc0(function->result_natts * sizeof(int));
-			function->result_fld_elem_typbyval = (bool *)
-											palloc0(function->result_natts * sizeof(bool));
-			function->result_fld_elem_typalign = (char *)
-											palloc0(function->result_natts * sizeof(char));
-	
-			for (i = 0; i < function->result_natts; i++)
-			{
-#if GP_VERSION_NUM >= 70000
-				function->result_fld_elem_typid[i] = get_element_type(TupleDescAttr(tupdesc, i)->atttypid);
-#else
-				function->result_fld_elem_typid[i] = get_element_type(tupdesc->attrs[i]->atttypid);
-#endif
-				if (OidIsValid(function->result_fld_elem_typid[i]))
-				{
-					get_type_io_data(function->result_fld_elem_typid[i], IOFunc_input,
-										&typlen, &typbyval, &typalign,
-										&typdelim, &typelem, &typinput);
-		
-					perm_fmgr_info(typinput, &inputproc);
-		
-					function->result_fld_elem_in_func[i] = inputproc;
-					function->result_fld_elem_typbyval[i] = typbyval;
-					function->result_fld_elem_typlen[i] = typlen;
-					function->result_fld_elem_typalign[i] = typalign;
-				}
+				get_type_io_data(function->result_fld_elem_typid[i], IOFunc_input,
+					function->result_fld_elem_typlen + i,
+					function->result_fld_elem_typbyval + i,
+					function->result_fld_elem_typalign + i,
+					&typdelim, &typelem, &typinput);
+
+				perm_fmgr_info(typinput, function->result_fld_elem_in_func + i);
 			}
-		}
-		else
-		{
-			/*
-			 * Is return type an array? get_element_type will return InvalidOid
-			 * instead of actual element type if the type is not a varlena array.
-			 */
-			if (OidIsValid(get_element_type(function->result_typid)))
-				function->result_elem = typeStruct->typelem;
-			else	/* not an array */
-				function->result_elem = InvalidOid;
-			
-			/*
-			 * if we have an array type, get the element type's in_func
-			 */
-			if (function->result_elem != InvalidOid)
-			{
-				int16		typlen;
-				bool		typbyval;
-				char		typdelim;
-				Oid			typinput,
-							typelem;
-				FmgrInfo	inputproc;
-				char		typalign;
-	
-				get_type_io_data(function->result_elem, IOFunc_input,
-										&typlen, &typbyval, &typalign,
-										&typdelim, &typelem, &typinput);
-	
-				perm_fmgr_info(typinput, &inputproc);
-	
-				function->result_elem_in_func = inputproc;
-				function->result_elem_typbyval = typbyval;
-				function->result_elem_typlen = typlen;
-				function->result_elem_typalign = typalign;
-			}
+			else
+				elog(ERROR, "Invalid type for return attribute #%u", i);
 		}
 		ReleaseSysCache(typeTup);
-	}
-	else /* trigger */
-	{
-		function->result_typid = TRIGGEROID;
-		function->result_istuple = true;
-		function->result_elem = InvalidOid;
-	}
 
-	/*
-	 * Get the required information for output conversion
-	 * of all procedure arguments
-	 */
-	if (!is_trigger)
-	{
-		int		i;
-		bool		forValidator = false;
-		int			numargs;
-		Oid		   *argtypes;
-		char	  **argnames;
-		char	   *argmodes;
+		/*
+		 * Get the required information for output conversion
+		 * of all procedure arguments
+		 */
 
 		numargs = get_func_arg_info(procTup,
 									&argtypes, &argnames, &argmodes);
@@ -1216,11 +1346,9 @@ do_compile(FunctionCallInfo fcinfo,
 											 forValidator,
 											 function->proname);
 
-
-		function->nargs = procStruct->pronargs;
-		for (i = 0; i < function->nargs; i++)
+		for (i = 0, j = 0; j < numargs; j++)
 		{
-			char		argmode = argmodes ? argmodes[i] : PROARGMODE_IN;
+			char		argmode = argmodes ? argmodes[j] : PROARGMODE_IN;
 
 			if (argmode != PROARGMODE_IN &&
 				argmode != PROARGMODE_INOUT &&
@@ -1248,22 +1376,7 @@ do_compile(FunctionCallInfo fcinfo,
 			}
 			typeStruct = (Form_pg_type) GETSTRUCT(typeTup);
 
-			/* Disallow pseudotype argument
-			 * note we already replaced ANYARRAY/ANYELEMENT
-			 */
-			if (typeStruct->typtype == 'p')
-			{
-				Oid		arg_typid = function->arg_typid[i];
-
-				xpfree(function->proname);
-				xpfree(function);
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("plr functions cannot take type %s",
-								format_type_be(arg_typid))));
-			}
-
-			if (typeStruct->typrelid != InvalidOid)
+			if (typeStruct->typrelid != InvalidOid || typeStruct->typtype == 'p')
 				function->arg_is_rel[i] = 1;
 			else
 				function->arg_is_rel[i] = 0;
@@ -1284,7 +1397,14 @@ do_compile(FunctionCallInfo fcinfo,
 
 			if (i > 0)
 				appendStringInfo(proc_internal_args, ",");
-			SET_ARG_NAME;
+
+			if (argnames && argnames[j] && argnames[j][0])
+			{
+				appendStringInfo(proc_internal_args, "%s", argnames[j]);
+				pfree(argnames[i]);
+			}
+			else
+				appendStringInfo(proc_internal_args, "arg%d", i + 1);
 
 			ReleaseSysCache(typeTup);
 
@@ -1309,8 +1429,10 @@ do_compile(FunctionCallInfo fcinfo,
 				function->arg_elem_typlen[i] = typlen;
 				function->arg_elem_typalign[i] = typalign;
 			}
+			i++;
 		}
 		FREE_ARG_NAMES;
+		function->nargs = i;
 
 #ifdef HAVE_WINDOW_FUNCTIONS
 		if (function->iswindow)
@@ -1417,25 +1539,7 @@ do_compile(FunctionCallInfo fcinfo,
 		elog(ERROR, "null prosrc");
 	proc_source = DatumGetCString(DirectFunctionCall1(textout, prosrcdatum));
 
-	/*
-	 * replace any carriage returns with either a space or a newline,
-	 * as appropriate
-	 */
-	p = proc_source;
-	while (*p != '\0')
-	{
-		if (p[0] == '\r')
-		{
-			if (p[1] == '\n')
-				/* for crlf sequence, write over the cr with a space */
-				*p++ = ' ';
-			else
-				/* otherwise write over the cr with a nl */
-				*p++ = '\n';
-		}
-		else
-			p++;
-	}
+	remove_carriage_return(proc_source);
 
 	/* parse or find the R function */
 	if(proc_source && proc_source[0])
@@ -1479,7 +1583,6 @@ plr_protected_parse(void* data)
 	ppd->out = R_PARSEVECTOR(ppd->in, -1, &ppd->status);
 }
 
-
 static SEXP
 plr_parse_func_body(const char *body)
 {
@@ -1506,39 +1609,18 @@ plr_parse_func_body(const char *body)
 }
 
 SEXP
-call_r_func(SEXP fun, SEXP rargs)
+call_r_func(SEXP fun, SEXP rargs, SEXP rho)
 {
-	int		i;
 	int		errorOccurred;
-	SEXP	obj,
-			args,
-			call,
+	SEXP	call,
 			ans;
-	long	n = length(rargs);
-
-	if(n > 0)
-	{
-		PROTECT(obj = args = allocList(n));
-		for (i = 0; i < n; i++)
-		{
-			SETCAR(obj, VECTOR_ELT(rargs, i));
-			obj = CDR(obj);
-		}
-		UNPROTECT(1);
         /*
          * NB: the headers of both R and Postgres define a function
          * called lcons, so use the full name to be precise about what
          * function we're calling.
          */
-		PROTECT(call = Rf_lcons(fun, args));
-	}
-	else
-	{
-		PROTECT(call = allocVector(LANGSXP,1));
-		SETCAR(call, fun);
-	}
-
-	ans = R_tryEval(call, R_GlobalEnv, &errorOccurred);
+	PROTECT(call = Rf_lcons(fun, rargs));
+	ans = R_tryEval(call, rho, &errorOccurred);
 	UNPROTECT(1);
 
 	if(errorOccurred)
@@ -1556,19 +1638,20 @@ call_r_func(SEXP fun, SEXP rargs)
 	return ans;
 }
 
-#if GP_VERSION_NUM >= 70000
+#if (PG_VERSION_NUM >= 120000)
 static SEXP
-plr_convertargs(plr_function *function, NullableDatum *nullablearg, FunctionCallInfo fcinfo)
+plr_convertargs(plr_function *function, NullableDatum *args, FunctionCallInfo fcinfo, SEXP rho)
 #else
 static SEXP
-plr_convertargs(plr_function *function, Datum *arg, bool *argnull, FunctionCallInfo fcinfo)
+plr_convertargs(plr_function *function, Datum *arg, bool *argnull, FunctionCallInfo fcinfo, SEXP rho)
 #endif
 {
 	int		i;
 	int		m = 1;
 	int		c = 0;
 	SEXP	rargs,
-			el;
+			t,
+			el = R_NilValue;
 
 #ifdef HAVE_WINDOW_FUNCTIONS
 	if (function->iswindow)
@@ -1583,10 +1666,10 @@ plr_convertargs(plr_function *function, Datum *arg, bool *argnull, FunctionCallI
 #endif
 
 	/*
-	 * Create an array of R objects with the number of elements
+	 * Create an R pairlist with the number of elements
 	 * as a function of the number of arguments.
 	 */
-	PROTECT(rargs = allocVector(VECSXP, c + (m * function->nargs)));
+	PROTECT(t = rargs = allocList(c + (m * function->nargs)));
 
 	/*
 	 * iterate over the arguments, convert each of them and put them in
@@ -1598,7 +1681,7 @@ plr_convertargs(plr_function *function, Datum *arg, bool *argnull, FunctionCallI
 		if (!function->iswindow)
 		{
 #endif
-			if (ARGNULL(i))
+			if (IS_ARG_NULL(i))
 			{
 				/* fast track for null arguments */
 				PROTECT(el = R_NilValue);
@@ -1606,12 +1689,12 @@ plr_convertargs(plr_function *function, Datum *arg, bool *argnull, FunctionCallI
 			else if (function->arg_is_rel[i])
 			{
 				/* for tuple args, convert to a one row data.frame */
-				CONVERT_TUPLE_TO_DATAFRAME;
+				CONVERT_TUPLE_TO_DATAFRAME(GET_ARG_VALUE(i));
 			}
 			else if (function->arg_elem[i] == InvalidOid)
 			{
 				/* for scalar args, convert to a one row vector */
-				Datum		dvalue = ARG(i);
+				Datum		dvalue = GET_ARG_VALUE(i);
 				Oid			arg_typid = function->arg_typid[i];
 				FmgrInfo	arg_out_func = function->arg_out_func[i];
 
@@ -1620,7 +1703,7 @@ plr_convertargs(plr_function *function, Datum *arg, bool *argnull, FunctionCallI
 			else
 			{
 				/* better be a pg array arg, convert to a multi-row vector */
-				Datum		dvalue = (Datum) PG_DETOAST_DATUM(ARG(i));
+				Datum		dvalue = (Datum) PG_DETOAST_DATUM(GET_ARG_VALUE(i));
 				FmgrInfo	out_func = function->arg_elem_out_func[i];
 				int			typlen = function->arg_elem_typlen[i];
 				bool		typbyval = function->arg_elem_typbyval[i];
@@ -1628,19 +1711,20 @@ plr_convertargs(plr_function *function, Datum *arg, bool *argnull, FunctionCallI
 
 				PROTECT(el = pg_array_get_r(dvalue, out_func, typlen, typbyval, typalign));
 			}
-			SET_VECTOR_ELT(rargs, i, el);
+			SETCAR(t, el);
+			t = CDR(t);
 			UNPROTECT(1);
 #ifdef HAVE_WINDOW_FUNCTIONS
 		}
 		else
 		{
 			Datum			dvalue;
-			bool			isnull;
+			bool			isnull,isout;
 			WindowObject	winobj = PG_WINDOW_OBJECT();
 
 			/* get datum for the current row of the window frame */
-			dvalue = WinGetFuncArgInFrame(winobj, i, 0, WINDOW_SEEK_CURRENT, false, &isnull, NULL);
-
+			dvalue = WinGetFuncArgInPartition(winobj, i, 0, WINDOW_SEEK_CURRENT, false, &isnull, &isout);
+			/* I think we can ignore isout as isnull should be set and null will be returned */ 
 			if (isnull)
 			{
 				/* fast track for null arguments */
@@ -1648,11 +1732,9 @@ plr_convertargs(plr_function *function, Datum *arg, bool *argnull, FunctionCallI
 			}
 			else if (function->arg_is_rel[i])
 			{
-				/* keep compiler quiet */
-				el = R_NilValue;
-
-				elog(ERROR, "Tuple arguments not supported in PL/R Window Functions");
-			}
+				/* for tuple args, convert to a one row data.frame */
+				CONVERT_TUPLE_TO_DATAFRAME(dvalue);
+ 			}
 			else if (function->arg_elem[i] == InvalidOid)
 			{
 				/* for scalar args, convert to a one row vector */
@@ -1672,7 +1754,8 @@ plr_convertargs(plr_function *function, Datum *arg, bool *argnull, FunctionCallI
 				dvalue = (Datum) PG_DETOAST_DATUM(dvalue);
 				PROTECT(el = pg_array_get_r(dvalue, out_func, typlen, typbyval, typalign));
 			}
-			SET_VECTOR_ELT(rargs, i, el);
+			SETCAR(t, el);
+			t = CDR(t);
 			UNPROTECT(1);
 		}
 #endif
@@ -1683,46 +1766,57 @@ plr_convertargs(plr_function *function, Datum *arg, bool *argnull, FunctionCallI
 	if (function->iswindow)
 	{
 		WindowObject	winobj = PG_WINDOW_OBJECT();
-		int64			totalrows = WinGetPartitionRowCount(winobj);
+		int64			current_row = WinGetCurrentPosition(winobj);
 		int				numels = 0;
 
-		for (i = 0; i < function->nargs; i++)
+		if (plr_is_unbound_frame(winobj))
 		{
-			Datum		   *dvalues = palloc0(totalrows * sizeof(Datum));
-			bool		   *isnulls = palloc0(totalrows * sizeof(bool));
-			Oid				datum_typid;
-			FmgrInfo		datum_out_func;
-			bool			datum_typbyval;
-			bool			has_nulls;
-
-			WinGetFrameData(winobj, i, dvalues, isnulls, &numels, &has_nulls);
-
-			datum_typid = function->arg_typid[i];
-			datum_out_func = function->arg_out_func[i];
-			datum_typbyval = function->arg_typbyval[i];
-			PROTECT(el = pg_datum_array_get_r(dvalues, isnulls, numels, has_nulls,
-											  datum_typid, datum_out_func, datum_typbyval));
-
-			/*
-			 * We already set function->nargs arguments
-			 * so we must start with a function->nargs
-			 */
-			SET_VECTOR_ELT(rargs, function->nargs + i, el);
-
-			UNPROTECT(1);
+			SEXP lst;
+			if (0 == current_row)
+			{
+				lst = PROTECT(allocVector(VECSXP, function->nargs));
+				for (i = 0; i < function->nargs; i++, t = CDR(t))
+				{
+					PROTECT(el = /* get_fn_expr_arg_stable(fcinfo->flinfo, i) ?
+						R_NilValue : */ pg_window_frame_get_r(winobj, i, function));
+					SET_VECTOR_ELT(lst, i, el);
+					UNPROTECT(1);
+					SETCAR(t, el);
+				}
+				defineVar(install(PLR_WINDOW_FRAME_NAME), lst, rho);
+				UNPROTECT(1);
+			}
+			else
+			{
+				lst = FINDVAR(install(PLR_WINDOW_FRAME_NAME), rho);
+				if (R_UnboundValue == lst)
+					elog(ERROR, "%s list with window frame data cannot be found in R_GlobalEnv", PLR_WINDOW_FRAME_NAME);
+				for (i = 0; i < function->nargs; i++, t = CDR(t))
+				{
+					el = VECTOR_ELT(lst, i);
+					SETCAR(t, el);
+				}
+			}
 		}
+		else
+			for (i = 0; i < function->nargs; i++, t = CDR(t))
+			{
+				PROTECT(el = /* get_fn_expr_arg_stable(fcinfo->flinfo, i) ?
+					R_NilValue : */ pg_window_frame_get_r(winobj, i, function));
+
+				SETCAR(t, el);
+				UNPROTECT(1);
+			}
+
+		/* below only works if last el <> R_NilValue (see commented out above) */
+		numels = function->nargs > 0 ? GET_LENGTH(el) : 0;
 
 		/* fnumrows */
-		PROTECT(el = NEW_NUMERIC(1));
-		NUMERIC_DATA(el)[0] = (double) numels;
-		SET_VECTOR_ELT(rargs, m * function->nargs + 0, el);
-		UNPROTECT(1);
+		SETCAR(t, ScalarInteger(numels));
+		t = CDR(t);
 
 		/* prownum */
-		PROTECT(el = NEW_NUMERIC(1));
-		NUMERIC_DATA(el)[0] = (double) WinGetCurrentPosition(winobj) + 1;;
-		SET_VECTOR_ELT(rargs, m * function->nargs + 1, el);
-		UNPROTECT(1);
+		SETCAR(t, ScalarInteger((int)current_row + 1));
 	}
 #endif
 
@@ -1741,31 +1835,38 @@ plr_error_callback(void *arg)
 }
 
 /*
- * getNamespaceOidFromFunctionOid - Returns the OID of the namespace for the
- * language handler function for the postgresql function with the OID equal
- * to the input argument.
+ * Sanitize R code by removing \r
+ */
+static void remove_carriage_return(char* p)
+{
+	while (*p != '\0')
+	{
+		if (p[0] == '\r')
+		{
+			if (p[1] == '\n')
+				/* for crlf sequence, write over the lf with a space */
+				*p++ = ' ';
+			else
+				/* otherwise write over the lf with a cr */
+				*p++ = '\n';
+		}
+		else
+			p++;
+	}
+}
+/*
+ * getNamespaceOidFromLanguageOid - Returns the OID of the namespace for the
+ * language with the OID equal to the input argument.
  */
 static Oid
-getNamespaceOidFromFunctionOid(Oid fnOid)
+getNamespaceOidFromLanguageOid(Oid langOid)
 {
 	HeapTuple			procTuple;
 	HeapTuple			langTuple;
 	Form_pg_proc		procStruct;
 	Form_pg_language	langStruct;
-	Oid					langOid;
 	Oid					hfnOid;
 	Oid					nspOid;
-
-	/* Lookup the pg_proc tuple for the called function by OID */
-	procTuple = SearchSysCache(PROCOID, ObjectIdGetDatum(fnOid), 0, 0, 0);
-
-	if (!HeapTupleIsValid(procTuple))
-		/* internal error */
-		elog(ERROR, "cache lookup failed for function %u", fnOid);
-
-	procStruct = (Form_pg_proc) GETSTRUCT(procTuple);
-	langOid = procStruct->prolang;
-	ReleaseSysCache(procTuple);
 
 	/* Lookup the pg_language tuple by OID */
 	langTuple = SearchSysCache(LANGOID, ObjectIdGetDatum(langOid), 0, 0, 0);
@@ -1850,54 +1951,6 @@ pg_unprotect(int n, char *fn, int ln)
 	unprotect(n);
 }
 #endif /* DEBUGPROTECT */
-
-#ifdef HAVE_WINDOW_FUNCTIONS
-/*
- * WinGetFrameData
- *		Evaluate a window function's argument expression on a specified
- *		window frame, returning an array of Datums for the frame
- *
- * argno: argument number to evaluate (counted from 0)
- * isnull: output argument, receives isnull status of result
- */
-static void
-WinGetFrameData(WindowObject winobj, int argno, Datum *dvalues, bool *isnulls, int *numels, bool *has_nulls)
-{
-	int64		i = 0;
-
-	*has_nulls = false;
-	for(;;)
-	{
-		Datum	lcl_dvalue;
-		bool	lcl_isnull;
-		bool	isout;
-		bool	set_mark;
-
-		if (i > 0)
-			set_mark = false;
-		else
-			set_mark = true;
-
-		lcl_dvalue = WinGetFuncArgInFrame(winobj, argno, i, WINDOW_SEEK_HEAD,
-										  set_mark, &lcl_isnull, &isout);
-
-		if (!isout)
-		{
-			dvalues[i] = lcl_dvalue;
-			isnulls[i] = lcl_isnull;
-			if (lcl_isnull)
-				*has_nulls = true;
-		}
-		else
-		{
-			*numels = i;
-			break;
-		}
-
-		i++;
-	};
-}
-#endif
 
 /*
  * swiped out of plpgsql pl_comp.c
