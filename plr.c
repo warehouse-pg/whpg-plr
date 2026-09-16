@@ -114,7 +114,22 @@ static Oid plr_nspOid = InvalidOid;
 #define SPI_CURSOR_CLOSE_CMD \
 			"pg.spi.cursor_close<-function(cursor) " \
 			"{.Call(\"plr_SPI_cursor_close\",cursor)}"
-#if CATALOG_VERSION_NO < 201811201
+/*
+ * SPI_lastoid was removed in PostgreSQL 12. Upstream detects that with
+ * CATALOG_VERSION_NO < 201811201, but Greenplum numbers its catalog versions
+ * on a different scheme entirely (GP6 301908232, GP7 302307241,
+ * GP19 302606222), so that test is false on every Greenplum line and
+ * pg.spi.lastoid never gets installed -- even on GP6, whose PostgreSQL 9.4
+ * base does still provide SPI_lastoid.
+ *
+ * The plr regress suite keys its own branch off server_version_num < 120000,
+ * so on GP6 the test called a function the C side had not defined:
+ *     Error in pg.spi.lastoid() : could not find function "pg.spi.lastoid"
+ *
+ * Gate on PG_VERSION_NUM instead, which is what upstream actually means and
+ * which agrees with the test on all three lines.
+ */
+#if PG_VERSION_NUM < 120000
 #define SPI_LASTOID_CMD \
 			"pg.spi.lastoid <-function() " \
 			"{.Call(\"plr_SPI_lastoid\")}"
@@ -622,7 +637,7 @@ plr_load_builtins(Oid langOid)
 		SPI_CURSOR_FETCH_CMD,
 		SPI_CURSOR_MOVE_CMD,
 		SPI_CURSOR_CLOSE_CMD,
-#if CATALOG_VERSION_NO < 201811201
+#if PG_VERSION_NUM < 120000
 		SPI_LASTOID_CMD,
 #endif
 #if PG_VERSION_NUM >= 110000

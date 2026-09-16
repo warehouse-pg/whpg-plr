@@ -597,7 +597,22 @@ plr_SPI_execp(SEXP rsaved_plan, SEXP rargvalues)
 	return result;
 }
 
-#if CATALOG_VERSION_NO < 201811201
+/*
+ * SPI_lastoid was removed in PostgreSQL 12. Upstream detects that with
+ * CATALOG_VERSION_NO < 201811201, but Greenplum numbers its catalog versions
+ * on a different scheme entirely (GP6 301908232, GP7 302307241,
+ * GP19 302606222), so that test is false on every Greenplum line and
+ * pg.spi.lastoid never gets installed -- even on GP6, whose PostgreSQL 9.4
+ * base does still provide SPI_lastoid.
+ *
+ * The plr regress suite keys its own branch off server_version_num < 120000,
+ * so on GP6 the test called a function the C side had not defined:
+ *     Error in pg.spi.lastoid() : could not find function "pg.spi.lastoid"
+ *
+ * Gate on PG_VERSION_NUM instead, which is what upstream actually means and
+ * which agrees with the test on all three lines.
+ */
+#if PG_VERSION_NUM < 120000
 /*
  * plr_SPI_lastoid - return the last oid. To be used after insert queries.
  */
