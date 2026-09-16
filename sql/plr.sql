@@ -132,7 +132,24 @@ select sprintf('%s is %s feet tall', 'Sven', '7');
 -- test aggregates
 --
 
-create table foo(f0 int, f1 text, f2 float8) distributed randomly;
+-- foo is created WITH OIDS on pre-12 servers so that pg.spi.lastoid() further
+-- down returns a real OID rather than 0: the test divides lastoid() by itself
+-- to get a stable 1, which becomes 0/0 = NaN on an OID-less table. WITH OIDS
+-- was removed in PostgreSQL 12, hence the branch (upstream does the same); the
+-- DISTRIBUTED clause is explicit on both so Greenplum emits no distribution
+-- NOTICE into the expected output.
+do language plpgsql $body$
+declare
+  pre_12 bool;
+begin
+  select current_setting('server_version_num')::integer < 120000 into pre_12;
+  if pre_12 then
+    execute $$create table foo(f0 int, f1 text, f2 float8) with oids distributed randomly$$;
+  else
+    create table foo(f0 int, f1 text, f2 float8) distributed randomly;
+  end if;
+end
+$body$;
 insert into foo values(1,'cat1',1.21);
 insert into foo values(2,'cat1',1.24);
 insert into foo values(3,'cat1',1.18);
