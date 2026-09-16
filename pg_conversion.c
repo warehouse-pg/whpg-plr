@@ -420,7 +420,15 @@ pg_window_frame_get_r(WindowObject winobj, int argno, plr_function* function)
 			tuple_hdr = DatumGetHeapTupleHeader(dvalue);
 			tuple->t_len = HeapTupleHeaderGetDatumLength(tuple_hdr);
 			ItemPointerSetInvalid(&(tuple->t_self));
+#if GP_VERSION_NUM >= 70000
+			/*
+			 * Greenplum 6's HeapTupleData is only { t_len, t_self, t_data } -
+			 * it has no t_tableOid, unlike the PostgreSQL 9.4 it derives from.
+			 * The same line is commented out in CONVERT_TUPLE_TO_DATAFRAME in
+			 * plr.h for this reason.
+			 */
 			tuple->t_tableOid = InvalidOid;
+#endif
 			tuple->t_data = tuple_hdr;
 		}
 
