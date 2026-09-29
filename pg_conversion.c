@@ -353,9 +353,9 @@ pg_window_frame_get_r(WindowObject winobj, int argno, plr_function* function)
 	TupleDesc	tupdesc = NULL;
 	/* for array arguments */
 	Oid			typelem = function->arg_elem[argno];
-	int16		typlen;
-	bool		typbyval;
-	char		typdelim, typalign;
+	int16		typlen = 0;
+	bool		typbyval = false;
+	char		typdelim, typalign = 'i';
 	Oid			typoutput, typioparam;
 	FmgrInfo	outputproc;
 	/* per-column type info for tuple arguments, looked up once on the first row */
