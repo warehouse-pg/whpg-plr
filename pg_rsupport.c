@@ -2,7 +2,7 @@
  * PL/R - PostgreSQL support for R as a
  *	      procedural language (PL)
  *
- * Copyright (c) 2003-2015 by Joseph E. Conway
+ * Copyright (c) 2003 by Joseph E. Conway
  * ALL RIGHTS RESERVED
  * 
  * Joe Conway <mail@joeconway.com>
@@ -52,15 +52,15 @@ typedef struct saved_plan_desc
  * Functions used in R
  *****************************************************************************/
 void
-throw_pg_notice(const char **msg)
+throw_pg_log(int* elevel, const char **msg)
 {
 	/* skip error CONTEXT for explicitly called messages */
 	SAVE_PLERRCONTEXT;
 
 	if (msg && *msg)
-		elog(NOTICE, "%s", *msg);
+		elog(*elevel, "%s", *msg);
 	else
-		elog(NOTICE, "%s", "");
+		elog(*elevel, "%s", "");
 
 	RESTORE_PLERRCONTEXT;
 }
@@ -598,6 +598,22 @@ plr_SPI_execp(SEXP rsaved_plan, SEXP rargvalues)
 }
 
 /*
+ * SPI_lastoid was removed in PostgreSQL 12. Upstream detects that with
+ * CATALOG_VERSION_NO < 201811201, but Greenplum numbers its catalog versions
+ * on a different scheme entirely (GP6 301908232, GP7 302307241,
+ * GP19 302606222), so that test is false on every Greenplum line and
+ * pg.spi.lastoid never gets installed -- even on GP6, whose PostgreSQL 9.4
+ * base does still provide SPI_lastoid.
+ *
+ * The plr regress suite keys its own branch off server_version_num < 120000,
+ * so on GP6 the test called a function the C side had not defined:
+ *     Error in pg.spi.lastoid() : could not find function "pg.spi.lastoid"
+ *
+ * Gate on PG_VERSION_NUM instead, which is what upstream actually means and
+ * which agrees with the test on all three lines.
+ */
+#if PG_VERSION_NUM < 120000
+/*
  * plr_SPI_lastoid - return the last oid. To be used after insert queries.
  */
 SEXP
@@ -615,6 +631,7 @@ plr_SPI_lastoid(void)
 	return result;
 #endif
 }
+#endif
 
 /*
  * Takes the prepared plan rsaved_plan and creates a cursor 
@@ -831,4 +848,30 @@ rsupport_error_callback(void *arg)
 	if (arg)
 		errcontext("In R support function %s", (char *) arg);
 }
+
+#if PG_VERSION_NUM >= 110000
+/*
+ * plr_SPI_commit - commit transaction and start a new one.
+ */
+SEXP
+plr_SPI_commit(void)
+{
+	SPI_commit();
+	SPI_start_transaction();
+
+	return NULL;
+}
+
+/*
+ * plr_SPI_rollback - abort transaction and start a new one.
+ */
+SEXP
+plr_SPI_rollback(void)
+{
+	SPI_rollback();
+	SPI_start_transaction();
+
+	return NULL;
+}
+#endif
 

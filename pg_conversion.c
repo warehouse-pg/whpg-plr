@@ -2,7 +2,7 @@
  * PL/R - PostgreSQL support for R as a
  *	      procedural language (PL)
  *
- * Copyright (c) 2003-2015 by Joseph E. Conway
+ * Copyright (c) 2003 by Joseph E. Conway
  * ALL RIGHTS RESERVED
  * 
  * Joe Conway <mail@joeconway.com>
@@ -33,10 +33,11 @@
  *                   to pg types
  */
 #include "plr.h"
+#include "utils/fmgroids.h"
 
-static void pg_get_one_r(char *value, Oid arg_out_fn_oid, SEXP *obj,
+static void pg_get_one_r(char *value, Oid arg_out_fn_oid, SEXP obj,
 																int elnum);
-static SEXP get_r_vector(Oid typtype, int numels);
+static SEXP get_r_vector(Oid typtype, int64 numels);
 static Datum get_trigger_tuple(SEXP rval, plr_function *function,
 									FunctionCallInfo fcinfo, bool *isnull);
 static Datum get_tuplestore(SEXP rval, plr_function *function,
@@ -52,19 +53,17 @@ static Datum get_generic_array_datum(SEXP rval, plr_function *function, int col,
 static Tuplestorestate *get_frame_tuplestore(SEXP rval,
 											 plr_function *function,
 											 AttInMetadata *attinmeta,
-											 MemoryContext per_query_ctx,
-											 bool retset);
+											 MemoryContext per_query_ctx);
 static Tuplestorestate *get_matrix_tuplestore(SEXP rval,
 											 plr_function *function,
 											 AttInMetadata *attinmeta,
-											 MemoryContext per_query_ctx,
-											 bool retset);
+											 MemoryContext per_query_ctx);
 static Tuplestorestate *get_generic_tuplestore(SEXP rval,
 											 plr_function *function,
 											 AttInMetadata *attinmeta,
-											 MemoryContext per_query_ctx,
-											 bool retset);
+											 MemoryContext per_query_ctx);
 static SEXP coerce_to_char(SEXP rval);
+static Datum r_get_tuple(SEXP rval, plr_function *function, FunctionCallInfo fcinfo, bool *isnull);
 
 extern char *last_R_error_msg;
 
@@ -88,7 +87,7 @@ pg_scalar_get_r(Datum dvalue, Oid arg_typid, FmgrInfo arg_out_func)
 
 		/* get new vector of the appropriate type, length 1 */
 		PROTECT(result = get_r_vector(arg_typid, 1));
-		pg_get_one_r(value, arg_typid, &result, 0);
+		pg_get_one_r(value, arg_typid, result, 0);
 		UNPROTECT(1);
 	}
 	else
@@ -107,8 +106,7 @@ pg_scalar_get_r(Datum dvalue, Oid arg_typid, FmgrInfo arg_out_func)
 		 * Need to construct a call to
 		 * unserialize(rval)
 		 */
-		PROTECT(t = s = allocList(2));
-		SET_TYPEOF(s, LANGSXP);
+		SET_ALLOCLANG_SIZE(2, s, t);
 		SETCAR(t, install("unserialize"));
 		t = CDR(t);
 		SETCAR(t, obj);
@@ -296,7 +294,7 @@ pg_array_get_r(Datum dvalue, FmgrInfo out_func, int typlen, bool typbyval, char 
 					 * Note that pg_get_one_r() replaces NULL values with
 					 * the NA value appropriate for the data type.
 					 */
-					pg_get_one_r(value, element_type, &result, idx);
+					pg_get_one_r(value, element_type, result, idx);
 					if (value != NULL)
 						pfree(value);
 				}
@@ -324,130 +322,290 @@ pg_array_get_r(Datum dvalue, FmgrInfo out_func, int typlen, bool typbyval, char 
 	return result;
 }
 
+#ifdef HAVE_WINDOW_FUNCTIONS
 /*
- * Given an array pg datums, convert to a multi-row R vector.
+ * Evaluate a window function's argument expression on a specified
+ * window frame, returning either an array or an R dataframe
+ * for the argno column in the frame, depending on whether
+ * the argno argument is of composite type or not
+ *
+ * winobj: PostgreSQL window object handle
+ * argno: argument number to evaluate (counted from 0)
+ * function: contains necessary info on how to output Datum as string for general case conversion
  */
 SEXP
-pg_datum_array_get_r(Datum *elem_values, bool *elem_nulls, int numels, bool has_nulls,
-					 Oid element_type, FmgrInfo out_func, bool typbyval)
+pg_window_frame_get_r(WindowObject winobj, int argno, plr_function* function)
 {
-	/*
-	 * Loop through and convert each scalar value.
-	 * Use the converted values to build an R vector.
-	 */
-	SEXP		result;
-	int			i;
-	bool		fast_track_type;
+	char		buf[256];
+	SEXP		result, v, names = R_NilValue, row_names;
+	int64		i, num_frame_row = 0;
+	int			j, nc = 1, nc_effective = 1, df_colnum = 0;
+	Datum		dvalue;
+	bool		isnull, isout = false;
+	bool		isrel = function->arg_is_rel[argno];
+	Oid			element_type = function->arg_typid[argno];
+	FmgrInfo	out_func = function->arg_out_func[argno];
+	/* for tuple arguments */
+	HeapTuple	tuple = NULL;
+	HeapTupleHeader	tuple_hdr;
+	Oid			tupType;
+	int32		tupTypmod;
+	TupleDesc	tupdesc = NULL;
+	/* for array arguments */
+	Oid			typelem = function->arg_elem[argno];
+	int16		typlen = 0;
+	bool		typbyval = false;
+	char		typdelim, typalign = 'i';
+	Oid			typoutput, typioparam;
+	FmgrInfo	outputproc;
+	/* per-column type info for tuple arguments, looked up once on the first row */
+	Oid		   *col_typid = NULL;
+	Oid		   *col_typelem = NULL;
+	int16	   *col_typlen = NULL;
+	bool	   *col_typbyval = NULL;
+	char	   *col_typalign = NULL;
+	FmgrInfo   *col_outputproc = NULL;
 
-	switch (element_type)
+	int64		num_partition_rows = WinGetPartitionRowCount(winobj);
+	if (num_partition_rows < 1)
+		return R_NilValue;
+
+	/*
+	 * Check to see if arg is an array type. typelem will be
+	 * InvalidOid instead of actual element type if the type is not a
+	 * varlena array.
+	 */
+	if (!isrel && typelem != InvalidOid)
 	{
-		case INT4OID:
-		case FLOAT8OID:
-			fast_track_type = true;
+		typlen = function->arg_elem_typlen[argno];
+		typbyval = function->arg_elem_typbyval[argno];
+		typalign = function->arg_elem_typalign[argno];
+		outputproc = function->arg_elem_out_func[argno];
+	}
+
+	if (isrel)
+	{
+		/*
+		 * Get current row for starters, setting mark
+		 * Need this to get tuple info in order to build an R dataframe
+		 */
+		dvalue = WinGetFuncArgInFrame(winobj, argno, 0, WINDOW_SEEK_HEAD,
+									  true, &isnull, &isout);
+		if (isout || isnull)
+			return R_NilValue;
+
+		/* Count non-dropped attributes so we can later ignore the dropped ones */
+		tuple_hdr = DatumGetHeapTupleHeader(dvalue);
+		tupType   = HeapTupleHeaderGetTypeId(tuple_hdr);
+		tupTypmod = HeapTupleHeaderGetTypMod(tuple_hdr);
+		tupdesc   = lookup_rowtype_tupdesc(tupType, tupTypmod);
+		nc		= tupdesc->natts;
+		for (j = 0, nc_effective = 0; j < nc; j++)
+		{
+			if (!TUPLE_DESC_ATTR(tupdesc,j)->attisdropped)
+				nc_effective++;
+		}
+		/*
+		 * Allocate the resulting data.frame initially as a list,
+		 * and also allocate a names vector for the column names.
+		 * If !isrel, then nc == nc_effective == 1, see below
+		 */
+		PROTECT(names = NEW_CHARACTER(nc_effective));
+
+		col_typid = palloc(nc * sizeof(Oid));
+		col_typelem = palloc(nc * sizeof(Oid));
+		col_typlen = palloc(nc * sizeof(int16));
+		col_typbyval = palloc(nc * sizeof(bool));
+		col_typalign = palloc(nc * sizeof(char));
+		col_outputproc = palloc(nc * sizeof(FmgrInfo));
+	}
+	PROTECT(result = NEW_LIST(nc_effective));
+
+	for (;; num_frame_row++)
+	{
+		dvalue = WinGetFuncArgInFrame(winobj, argno, num_frame_row, WINDOW_SEEK_HEAD, num_frame_row == 0, &isnull, &isout);
+
+		if (isout)
 			break;
-		default:
-			fast_track_type = false;
-	}
 
-	/*
-	 * Special case for pass-by-value data types, if the following conditions are met:
-	 * 		designated fast_track_type
-	 * 		no NULL elements
-	 * 		1 dimensional array only
-	 * 		at least one element
-	 */
-	if (fast_track_type &&
-		 typbyval &&
-		 !has_nulls &&
-		 (numels > 0))
-	{
-		SEXP	matrix_dims;
-
-		/* get new vector of the appropriate type and length */
-		PROTECT(result = get_r_vector(element_type, numels));
-
-		/* keep this in sync with switch above -- fast_track_type only */
-		switch (element_type)
+		if (isrel && !isnull)
 		{
-			case INT4OID:
-				Assert(sizeof(int) == 4);
-				memcpy(INTEGER_DATA(result), elem_values, numels * sizeof(int));
-				break;
-			case FLOAT8OID:
-				Assert(sizeof(double) == 8);
-				memcpy(NUMERIC_DATA(result), elem_values, numels * sizeof(double));
-				break;
-			default:
-				/* Everything else is error */
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("direct array passthrough attempted for unsupported type")));
-		}
-
-		/* attach dimensions */
-		PROTECT(matrix_dims = allocVector(INTSXP, 1));
-		INTEGER_DATA(matrix_dims)[0] = numels;
-		setAttrib(result, R_DimSymbol, matrix_dims);
-		UNPROTECT(1);
-
-		UNPROTECT(1);	/* result */
-	}
-	else
-	{
-		SEXP	matrix_dims;
-
-		/* array is empty */
-		if (numels == 0)
-		{
-			PROTECT(result = get_r_vector(element_type, 0));
-			UNPROTECT(1);
-
-			return result;
-		}
-
-		/* get new vector of the appropriate type and length */
-		PROTECT(result = get_r_vector(element_type, numels));
-
-		/* Convert all values to their R form and build the vector */
-		for (i = 0; i < numels; i++)
-		{
-			char	   *value;
-			Datum		itemvalue;
-			bool		isnull;
-
-			isnull = elem_nulls[i];
-			itemvalue = elem_values[i];
-
-			if (!isnull)
-			{
-				value = DatumGetCString(FunctionCall3(&out_func,
-													  itemvalue,
-													  (Datum) 0,
-													  Int32GetDatum(-1)));
-			}
-			else
-				value = NULL;
-
+			/* Allocate new heaptuple for this row and set contents */
+			tuple = palloc(sizeof(HeapTupleData));
+			tuple_hdr = DatumGetHeapTupleHeader(dvalue);
+			tuple->t_len = HeapTupleHeaderGetDatumLength(tuple_hdr);
+			ItemPointerSetInvalid(&(tuple->t_self));
+#if GP_VERSION_NUM >= 70000
 			/*
-			 * Note that pg_get_one_r() replaces NULL values with
-			 * the NA value appropriate for the data type.
+			 * Greenplum 6's HeapTupleData is only { t_len, t_self, t_data } -
+			 * it has no t_tableOid, unlike the PostgreSQL 9.4 it derives from.
+			 * The same line is commented out in CONVERT_TUPLE_TO_DATAFRAME in
+			 * plr.h for this reason.
 			 */
-			pg_get_one_r(value, element_type, &result, i);
-			if (value != NULL)
-				pfree(value);
+			tuple->t_tableOid = InvalidOid;
+#endif
+			tuple->t_data = tuple_hdr;
 		}
 
-		/* attach dimensions */
-		PROTECT(matrix_dims = allocVector(INTSXP, 1));
-		INTEGER_DATA(matrix_dims)[0] = numels;
-		setAttrib(result, R_DimSymbol, matrix_dims);
-		UNPROTECT(1);
+		for (df_colnum = 0, j = 0; j < nc; j++)
+		{
+			if (isrel)
+			{
+				/* ignore dropped attributes */
+				if (TUPLE_DESC_ATTR(tupdesc,j)->attisdropped)
+					continue;
 
-		UNPROTECT(1);	/* result */
+				/* set column names */
+				if (num_frame_row == 0)
+					SET_COLUMN_NAMES;
+
+				/*
+				 * Update column datatype oid and check for embedded array.
+				 * The catalog lookups only happen on the first frame row;
+				 * later rows reuse the cached per-column info.
+				 */
+				if (num_frame_row == 0)
+				{
+					col_typid[j] = SPI_gettypeid(tupdesc, j + 1);
+					col_typelem[j] = get_element_type(col_typid[j]);
+					if (col_typelem[j] != InvalidOid)
+					{
+						get_type_io_data(col_typelem[j], IOFunc_output,
+										 col_typlen + j, col_typbyval + j, col_typalign + j,
+										 &typdelim, &typioparam, &typoutput);
+						fmgr_info(typoutput, col_outputproc + j);
+					}
+				}
+				element_type = col_typid[j];
+				typelem = col_typelem[j];
+				if (typelem != InvalidOid)
+				{
+					typlen = col_typlen[j];
+					typbyval = col_typbyval[j];
+					typalign = col_typalign[j];
+					outputproc = col_outputproc[j];
+				}
+			}
+
+			if (num_frame_row == 0)
+			{
+				/* allocate new vector of the appropriate type and length */
+				if (typelem == InvalidOid)
+					/* dealing with scalars of element_type */
+					PROTECT(v = get_r_vector(element_type, num_partition_rows));
+				else
+					/* dealing with arrays (containing typelem's) */
+					PROTECT(v = NEW_LIST(num_partition_rows));
+				SET_VECTOR_ELT(result, df_colnum, v);
+				UNPROTECT(1);
+			}
+
+			v = VECTOR_ELT(result, df_colnum);
+			if (!isrel && typelem == InvalidOid)
+			{
+				/* scalar type */
+				char	   *value;
+				switch (element_type)
+				{
+					case BOOLOID:
+						LOGICAL_DATA(v)[num_frame_row] = isnull ? NA_LOGICAL : DatumGetBool(dvalue);
+						break;
+					case INT8OID:
+						NUMERIC_DATA(v)[num_frame_row] = isnull ? NA_REAL : (double)DatumGetInt64(dvalue);
+						break;
+					case INT2OID:
+					case INT4OID:
+					case OIDOID:
+						INTEGER_DATA(v)[num_frame_row] = isnull ? NA_INTEGER : DatumGetInt32(dvalue);
+						break;
+					case FLOAT4OID:
+						NUMERIC_DATA(v)[num_frame_row] = isnull ? NA_REAL : DatumGetFloat4(dvalue);
+						break;
+					case FLOAT8OID:
+						NUMERIC_DATA(v)[num_frame_row] = isnull ? NA_REAL : DatumGetFloat8(dvalue);
+						break;
+					default:
+						value = isnull ? NULL :
+							DatumGetCString(FunctionCall3(&out_func, dvalue, (Datum) 0, Int32GetDatum(-1)));
+						/*
+						 * Note that pg_get_one_r() replaces NULL values with
+						 * the NA value appropriate for the data type.
+						 */
+						pg_get_one_r(value, element_type, v, num_frame_row);
+						if (value != NULL)
+							pfree(value);
+				}
+			}
+			else if (isrel && typelem == InvalidOid)
+			{
+				char *value = isnull ? NULL : SPI_getvalue(tuple, tupdesc, j + 1);
+				pg_get_one_r(value, element_type, v, num_frame_row);
+				if (value != NULL)
+					pfree(value);
+			}
+			else /* typelem != InvalidOid, i.e.: */
+			{
+				/* array type (regardless of whether embedded in a tuple or not) */
+				SEXP		fldvec_elem;
+				Datum	   value = dvalue;
+				bool		isvaluenull = isnull;
+				if (isrel && !isnull)
+					value = SPI_getbinval(tuple, tupdesc, j + 1, &isvaluenull);
+
+				if (!isvaluenull)
+					PROTECT(fldvec_elem = pg_array_get_r(value, outputproc, typlen, typbyval, typalign));
+				else
+					PROTECT(fldvec_elem = R_NilValue);
+				SET_VECTOR_ELT(v, num_frame_row, fldvec_elem);
+				UNPROTECT(1);
+			}
+			df_colnum++;
+		}
+
+		if (isrel && !isnull)
+			pfree(tuple);
 	}
 
+	/* Resize all vectors from num_partition_rows (rows in partition) down to num_frame_row (rows in frame) */
+	if (num_frame_row < num_partition_rows)
+	{
+		for (df_colnum = 0, j = 0; j < nc; j++)
+		{
+			if (isrel && TUPLE_DESC_ATTR(tupdesc,j)->attisdropped)
+				continue;
+			v = VECTOR_ELT(result, df_colnum);
+			SET_VECTOR_ELT(result, df_colnum, SET_LENGTH(v, num_frame_row));
+			df_colnum++;
+		}
+	}
+
+	/* for non-tuple arguments return now */
+	if (!isrel)
+	{
+		v = VECTOR_ELT(result, 0);
+		UNPROTECT(1); /* result */
+		return v;
+	}
+
+	/* attach the column names */
+	setAttrib(result, R_NamesSymbol, names);
+
+	/* attach row names - basically just the row number, zero based */
+	PROTECT(row_names = allocVector(STRSXP, num_frame_row));
+	for (i = 0; i < num_frame_row; i++)
+	{
+		sprintf(buf, "%ld", i + 1);
+		SET_STRING_ELT(row_names, i, COPY_TO_USER_STRING(buf));
+	}
+	setAttrib(result, R_RowNamesSymbol, row_names);
+
+	/* finally, tell R we are a data.frame */
+	setAttrib(result, R_ClassSymbol, mkString("data.frame"));
+	ReleaseTupleDesc(tupdesc);
+	UNPROTECT(3); /* result, names, row-names */
 	return result;
 }
+#endif
 
 /*
  * Given an array of pg tuples, convert to an R list
@@ -476,11 +634,8 @@ pg_tuple_get_r_frame(int ntuples, HeapTuple *tuples, TupleDesc tupdesc)
 	/* Count non-dropped attributes so we can later ignore the dropped ones */
 	for (j = 0; j < nc; j++)
 	{
-#if GP_VERSION_NUM >= 70000
-		if (!TupleDescAttr(tupdesc, j)->attisdropped)
-#else
-		if (!tupdesc->attrs[j]->attisdropped)
-#endif
+		/* upstream REL8_4_8_7 indexes i here inside a j loop */
+		if (!TUPLE_DESC_ATTR(tupdesc,j)->attisdropped)
 			nc_non_dropped++;
 	}
 
@@ -505,13 +660,8 @@ pg_tuple_get_r_frame(int ntuples, HeapTuple *tuples, TupleDesc tupdesc)
 		char		typalign;
 
 		/* ignore dropped attributes */
-#if GP_VERSION_NUM >= 70000
-		if (TupleDescAttr(tupdesc, j)->attisdropped)
+		if (TUPLE_DESC_ATTR(tupdesc,j)->attisdropped)
 			continue;
-#else
-		if (tupdesc->attrs[j]->attisdropped)
-			continue;
-#endif
 
 		/* set column name */
 		SET_COLUMN_NAMES;
@@ -547,7 +697,7 @@ pg_tuple_get_r_frame(int ntuples, HeapTuple *tuples, TupleDesc tupdesc)
 				char	   *value;
 
 				value = SPI_getvalue(tuples[i], tupdesc, j + 1);
-				pg_get_one_r(value, element_type, &fldvec, i);
+				pg_get_one_r(value, element_type, fldvec, i);
 			}
 			else
 			{
@@ -595,7 +745,7 @@ pg_tuple_get_r_frame(int ntuples, HeapTuple *tuples, TupleDesc tupdesc)
  * create an R vector of a given type and size based on pg output function oid
  */
 static SEXP
-get_r_vector(Oid typtype, int numels)
+get_r_vector(Oid typtype, int64 numels)
 {
 	SEXP	result;
 
@@ -638,7 +788,7 @@ get_r_vector(Oid typtype, int numels)
  * given a single non-array pg value, convert to its R value representation
  */
 static void
-pg_get_one_r(char *value, Oid typtype, SEXP *obj, int elnum)
+pg_get_one_r(char *value, Oid typtype, SEXP obj, int elnum)
 {
 	switch (typtype)
 	{
@@ -647,9 +797,9 @@ pg_get_one_r(char *value, Oid typtype, SEXP *obj, int elnum)
 		case INT4OID:
 			/* 2 and 4 byte integer pgsql datatype => use R INTEGER */
 			if (value)
-				INTEGER_DATA(*obj)[elnum] = atoi(value);
+				INTEGER_DATA(obj)[elnum] = atoi(value);
 			else
-				INTEGER_DATA(*obj)[elnum] = NA_INTEGER;
+				INTEGER_DATA(obj)[elnum] = NA_INTEGER;
 			break;
 		case INT8OID:
 		case FLOAT4OID:
@@ -662,22 +812,27 @@ pg_get_one_r(char *value, Oid typtype, SEXP *obj, int elnum)
 			 * because R INTEGER is only 4 byte
 			 */
 			if (value)
-				NUMERIC_DATA(*obj)[elnum] = atof(value);
+			{
+				/* fixup for Visual Studio 2013, _MSC_VER == 1916*/
+				char *endptr = NULL;
+				const double el = strtod(value, &endptr);
+				NUMERIC_DATA(obj)[elnum] = value==endptr ? R_NaN : el;
+			}
 			else
-				NUMERIC_DATA(*obj)[elnum] = NA_REAL;
+				NUMERIC_DATA(obj)[elnum] = NA_REAL;
 			break;
 		case BOOLOID:
 			if (value)
-				LOGICAL_DATA(*obj)[elnum] = ((*value == 't') ? 1 : 0);
+				LOGICAL_DATA(obj)[elnum] = ((*value == 't') ? 1 : 0);
 			else
-				LOGICAL_DATA(*obj)[elnum] = NA_LOGICAL;
+				LOGICAL_DATA(obj)[elnum] = NA_LOGICAL;
 			break;
 		default:
 			/* Everything else is defaulted to string */
 			if (value)
-				SET_STRING_ELT(*obj, elnum, COPY_TO_USER_STRING(value));
+				SET_STRING_ELT(obj, elnum, COPY_TO_USER_STRING(value));
 			else
-				SET_STRING_ELT(*obj, elnum, NA_STRING);
+				SET_STRING_ELT(obj, elnum, NA_STRING);
 	}
 }
 
@@ -690,21 +845,12 @@ r_get_pg(SEXP rval, plr_function *function, FunctionCallInfo fcinfo)
 	bool	isnull = false;
 	Datum	result;
 
-	if (function->result_typid != BYTEAOID &&
-		(TYPEOF(rval) == CLOSXP ||
-		 TYPEOF(rval) == PROMSXP ||
-		 TYPEOF(rval) == LANGSXP ||
-		 TYPEOF(rval) == ENVSXP))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_EXCEPTION),
-				 errmsg("incorrect function return type"),
-				 errdetail("R return value type cannot be mapped to PostgreSQL return type."),
-				 errhint("Try BYTEA as the PostgreSQL return type.")));
-
 	if (CALLED_AS_TRIGGER(fcinfo))
 		result = get_trigger_tuple(rval, function, fcinfo, &isnull);
-	else if (function->result_istuple || fcinfo->flinfo->fn_retset)
+	else if (fcinfo->flinfo->fn_retset)
 		result = get_tuplestore(rval, function, fcinfo, &isnull);
+	else if (function->result_natts > 1)
+		result = r_get_tuple(rval, function, fcinfo, &isnull);
 	else
 	{
 		/* short circuit if return value is Null */
@@ -714,8 +860,8 @@ r_get_pg(SEXP rval, plr_function *function, FunctionCallInfo fcinfo)
 			return (Datum) 0;
 		}
 
-		if (function->result_elem == 0)
-			result = get_scalar_datum(rval, function->result_typid, function->result_in_func, &isnull);
+		if (function->result_fld_elem_typid[0] == function->result_fld_typid[0])
+			result = get_scalar_datum(rval, function->result_fld_typid[0], function->result_fld_elem_in_func[0], &isnull);
 		else
 			result = get_array_datum(rval, function, 0, &isnull);
 
@@ -725,6 +871,63 @@ r_get_pg(SEXP rval, plr_function *function, FunctionCallInfo fcinfo)
 		fcinfo->isnull = true;
 
 	return result;
+}
+
+/*
+ * Given an R value (data frame or list), coerce it to list
+ * and get a tuple representing first elements of each list element.
+ *
+ * This is used to return a single RECORD (not SETOF)
+ */
+Datum
+r_get_tuple(SEXP rval, plr_function *function, FunctionCallInfo fcinfo, bool *isnull)
+{
+	Oid			oid;
+	TupleDesc	tupdesc;
+	HeapTuple	tuple;
+	Datum	   *values;
+	bool	   *nulls;
+	int			i, min_length;
+
+	/* short circuit if return value is Null */
+	if (rval == R_NilValue || isNull(rval))
+	{
+		*isnull = true;
+		return (Datum) 0;
+	}
+
+	if (!(IS_DATAFRAME(rval) || isNewList(rval) || isList(rval)))
+		elog(ERROR, "Only list alike is expected");
+
+	if (TYPEFUNC_COMPOSITE != get_call_result_type(fcinfo, &oid, &tupdesc))
+		elog(ERROR, "return type must be a row type");
+
+	min_length = Min(function->result_natts, length(rval));
+
+	BlessTupleDesc(tupdesc);
+
+	values = palloc0(sizeof(Datum) * tupdesc->natts);
+	nulls = palloc0(sizeof(bool) * tupdesc->natts);
+
+	for (i = 0; i < min_length; i++)
+	{
+		SEXP el = VECTOR_ELT(rval, i);
+		if (function->result_fld_typid[i] != function->result_fld_elem_typid[i])
+			values[i] = get_array_datum(el, function, i, nulls + i);
+		else
+			values[i] = get_scalar_datum(el, function->result_fld_elem_typid[i], function->result_fld_elem_in_func[i], nulls + i);
+	}
+
+	/* an R list shorter than the row type leaves the trailing columns NULL */
+	for (; i < tupdesc->natts; i++)
+		nulls[i] = true;
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	pfree(values);
+	pfree(nulls);
+	ReleaseTupleDesc(tupdesc);
+	*isnull = false;
+	return HeapTupleGetDatum(tuple);
 }
 
 /*
@@ -785,7 +988,7 @@ get_trigger_tuple(SEXP rval, plr_function *function, FunctionCallInfo fcinfo, bo
 		return (Datum) 0;
 	}
 
-	if (isFrame(rval))
+	if (IS_DATAFRAME(rval))
 		nc = length(rval);
 	else if (isMatrix(rval))
 		nc = ncols(rval);
@@ -809,11 +1012,7 @@ get_trigger_tuple(SEXP rval, plr_function *function, FunctionCallInfo fcinfo, bo
 	 */
 	for (j = 0; j < nc; j++)
 	{
-#if GP_VERSION_NUM >= 70000
-		if (TupleDescAttr(tupdesc, j)->attisdropped)
-#else
-		if (tupdesc->attrs[j]->attisdropped)
-#endif
+		if (TUPLE_DESC_ATTR(tupdesc,j)->attisdropped)
 			nc_dropped++;
 	}
 
@@ -853,9 +1052,9 @@ get_trigger_tuple(SEXP rval, plr_function *function, FunctionCallInfo fcinfo, bo
 		}
 		else
 		{
-			SEXP 	t;
+			SEXP 	t; 
 
-			for (t = ATTRIB(dfcol); t != R_NilValue; t = CDR(t))
+			for (t = dfcol; ANY_ATTRIB(t); t = CDR(t))
 			{
 				if(TAG(t) == R_LevelsSymbol)
 				{
@@ -876,11 +1075,7 @@ get_trigger_tuple(SEXP rval, plr_function *function, FunctionCallInfo fcinfo, bo
 		for (j = 0; j < nc + nc_dropped; j++)
 		{
 			/* insert NULL for dropped attributes */
-#if GP_VERSION_NUM >= 70000
-			if (TupleDescAttr(tupdesc, j)->attisdropped)
-#else
-			if (tupdesc->attrs[j]->attisdropped)
-#endif
+			if (TUPLE_DESC_ATTR(tupdesc,j)->attisdropped)
 				values[j] = NULL;
 			else
 			{
@@ -889,7 +1084,7 @@ get_trigger_tuple(SEXP rval, plr_function *function, FunctionCallInfo fcinfo, bo
 				if(isFactor(dfcol))
 				{
 					SEXP t;
-					for (t = ATTRIB(dfcol); t != R_NilValue; t = CDR(t))
+					for (t = dfcol; ANY_ATTRIB(t); t = CDR(t))
 					{
 						if(TAG(t) == R_LevelsSymbol)
 						{
@@ -943,7 +1138,6 @@ get_trigger_tuple(SEXP rval, plr_function *function, FunctionCallInfo fcinfo, bo
 static Datum
 get_tuplestore(SEXP rval, plr_function *function, FunctionCallInfo fcinfo, bool *isnull)
 {
-	bool			retset = fcinfo->flinfo->fn_retset;
 	ReturnSetInfo  *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	TupleDesc		tupdesc;
 	AttInMetadata  *attinmeta;
@@ -958,7 +1152,7 @@ get_tuplestore(SEXP rval, plr_function *function, FunctionCallInfo fcinfo, bool 
 				 errmsg("materialize mode required, but it is not "
 						"allowed in this context")));
 
-	if (isFrame(rval))
+	if (IS_DATAFRAME(rval))
 		nc = length(rval);
 	else if (isList(rval) || isNewList(rval))
 		nc = length(rval);
@@ -992,14 +1186,12 @@ get_tuplestore(SEXP rval, plr_function *function, FunctionCallInfo fcinfo, bool 
 	/* OK, go to work */
 	rsinfo->returnMode = SFRM_Materialize;
 
-	if (isFrame(rval))
-		rsinfo->setResult = get_frame_tuplestore(rval, function, attinmeta, per_query_ctx, retset);
-	else if (isList(rval) || isNewList(rval))
-		rsinfo->setResult = get_frame_tuplestore(rval, function, attinmeta, per_query_ctx, retset);
+	if (IS_DATAFRAME(rval) || isList(rval) || isNewList(rval))
+		rsinfo->setResult = get_frame_tuplestore(rval, function, attinmeta, per_query_ctx);
 	else if (isMatrix(rval))
-		rsinfo->setResult = get_matrix_tuplestore(rval, function, attinmeta, per_query_ctx, retset);
+		rsinfo->setResult = get_matrix_tuplestore(rval, function, attinmeta, per_query_ctx);
 	else
-		rsinfo->setResult = get_generic_tuplestore(rval, function, attinmeta, per_query_ctx, retset);
+		rsinfo->setResult = get_generic_tuplestore(rval, function, attinmeta, per_query_ctx);
 
 	/*
 	 * SFRM_Materialize mode expects us to return a NULL Datum. The actual
@@ -1044,18 +1236,19 @@ get_scalar_datum(SEXP rval, Oid result_typid, FmgrInfo result_in_func, bool *isn
 			dvalue = (Datum) 0;
 			return dvalue;
 		}
- 		obj = STRING_ELT(obj, 0);
- 		if (TYPEOF(obj) == CHARSXP )
- 		{
- 			value = CHAR(obj);
- 		}
- 		else
- 		{
- 			ereport(ERROR,
- 					(errcode(ERRCODE_DATA_EXCEPTION),
- 					 errmsg("R interpreter expression evaluation error"),
- 					 errdetail("return type cannot be coerced to char")));
- 		}		UNPROTECT(1);
+		obj = STRING_ELT(obj, 0);
+		if (TYPEOF(obj) == CHARSXP )
+		{
+			value = CHAR(obj);
+		}
+		else
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_EXCEPTION),
+					 errmsg("R interpreter expression evaluation error"),
+					 errdetail("return type cannot be coerced to char")));
+		}
+		UNPROTECT(1);
 		
 		if (value != NULL)
 		{
@@ -1081,8 +1274,7 @@ get_scalar_datum(SEXP rval, Oid result_typid, FmgrInfo result_in_func, bool *isn
 		 * Need to construct a call to
 		 * serialize(rval, NULL)
 		 */
-		PROTECT(t = s = allocList(3));
-		SET_TYPEOF(s, LANGSXP);
+		SET_ALLOCLANG_SIZE(3, s, t);
 		SETCAR(t, install("serialize")); t = CDR(t);
 		SETCAR(t, rval); t = CDR(t);
 		SETCAR(t, R_NilValue);
@@ -1127,7 +1319,7 @@ get_array_datum(SEXP rval, plr_function *function, int col, bool *isnull)
 	if (objlen > 0)
 	{
 		/* two supported special cases */
-		if (isFrame(rval))
+		if (IS_DATAFRAME(rval))
 			return get_frame_array_datum(rval, function,  col, isnull);
 		else if (isMatrix(rval))
 			return get_md_array_datum(rval, 2 /* matrix is 2D */, function, col, isnull);
@@ -1146,7 +1338,7 @@ get_array_datum(SEXP rval, plr_function *function, int col, bool *isnull)
 	else
 	{
 		/* create an empty array */
-		return PointerGetDatum(construct_empty_array(function->result_elem));
+		return PointerGetDatum(construct_empty_array(function->result_fld_elem_typid[col]));
 	}
 }
 
@@ -1181,22 +1373,11 @@ get_frame_array_datum(SEXP rval, plr_function *function, int col, bool *isnull)
 		/* internal error */
 		elog(ERROR, "plr: bad internal representation of data.frame");
 
-	if (function->result_istuple)
-	{
-		result_elem = function->result_fld_elem_typid[col];
-		in_func = function->result_fld_elem_in_func[col];
-		typlen = function->result_fld_elem_typlen[col];
-		typbyval = function->result_fld_elem_typbyval[col];
-		typalign = function->result_fld_elem_typalign[col];
-	}
-	else
-	{
-		result_elem = function->result_elem;
-		in_func = function->result_elem_in_func;
-		typlen = function->result_elem_typlen;
-		typbyval = function->result_elem_typbyval;
-		typalign = function->result_elem_typalign;
-	}
+	result_elem = function->result_fld_elem_typid[col];
+	in_func = function->result_fld_elem_in_func[col];
+	typlen = function->result_fld_elem_typlen[col];
+	typbyval = function->result_fld_elem_typbyval[col];
+	typalign = function->result_fld_elem_typalign[col];
 	
 	for (j = 0; j < nc; j++)
 	{
@@ -1216,11 +1397,11 @@ get_frame_array_datum(SEXP rval, plr_function *function, int col, bool *isnull)
 		 * factors and do the alternative assignment ONLY for them.
 		 * For the moment this locution seems to work correctly.
 		 */
-		if (ATTRIB(dfcol) == R_NilValue ||
-			TYPEOF(CAR(ATTRIB(dfcol))) != STRSXP)
+		if (NO_ATTRIB(dfcol) ||
+			TYPEOF_CAR(dfcol) != STRSXP)
 			PROTECT(obj = coerce_to_char(dfcol));
 		else
-			PROTECT(obj = coerce_to_char(CAR(ATTRIB(dfcol))));
+			PROTECT(obj = coerce_to_char(CAR(dfcol)));
 
 		if (j == 0)
 		{
@@ -1383,7 +1564,7 @@ get_md_array_datum(SEXP rval, int ndims, plr_function *function, int col, bool *
 	int			cntr = 0;
 	bool	   *nulls;
 	bool		have_nulls = FALSE;
-	Oid 		return_type_oid = function->result_elem;
+	Oid 		return_type_oid = function->result_fld_elem_typid[col];
 
 	if (ndims > 0)
 	{
@@ -1396,22 +1577,11 @@ get_md_array_datum(SEXP rval, int ndims, plr_function *function, int col, bool *
 		lbs = NULL;
 	}
 	
-	if (function->result_istuple)
-	{
-		result_elem = function->result_fld_elem_typid[col];
-		in_func = function->result_fld_elem_in_func[col];
-		typlen = function->result_fld_elem_typlen[col];
-		typbyval = function->result_fld_elem_typbyval[col];
-		typalign = function->result_fld_elem_typalign[col];
-	}
-	else
-	{
-		result_elem = function->result_elem;
-		in_func = function->result_elem_in_func;
-		typlen = function->result_elem_typlen;
-		typbyval = function->result_elem_typbyval;
-		typalign = function->result_elem_typalign;
-	}
+	result_elem = function->result_fld_elem_typid[col];
+	in_func = function->result_fld_elem_in_func[col];
+	typlen = function->result_fld_elem_typlen[col];
+	typbyval = function->result_fld_elem_typbyval[col];
+	typalign = function->result_fld_elem_typalign[col];
 
 	PROTECT(rdims = getAttrib(rval, R_DimSymbol));
 	for(i = 0; i < ndims; i++)
@@ -1538,7 +1708,7 @@ get_md_array_datum(SEXP rval, int ndims, plr_function *function, int col, bool *
 					else
 					{
 						nulls[arridx] = FALSE;
-						dvalues[arridx] = Float8GetDatum((double) REAL(rval)[idx]);
+						dvalues[arridx] = DirectFunctionCall1(float8_numeric, Float8GetDatum((double)REAL(rval)[idx]));
 					}
 				}
 			}
@@ -1662,22 +1832,11 @@ get_generic_array_datum(SEXP rval, plr_function *function, int col, bool *isnull
 	bool		fast_track_type;
 	bool		has_na = false;
 
-	if (function->result_istuple)
-	{
-		result_elem = function->result_fld_elem_typid[col];
-		in_func = function->result_fld_elem_in_func[col];
-		typlen = function->result_fld_elem_typlen[col];
-		typbyval = function->result_fld_elem_typbyval[col];
-		typalign = function->result_fld_elem_typalign[col];
-	}
-	else
-	{
-		result_elem = function->result_elem;
-		in_func = function->result_elem_in_func;
-		typlen = function->result_elem_typlen;
-		typbyval = function->result_elem_typbyval;
-		typalign = function->result_elem_typalign;
-	}
+	result_elem = function->result_fld_elem_typid[col];
+	in_func = function->result_fld_elem_in_func[col];
+	typlen = function->result_fld_elem_typlen[col];
+	typbyval = function->result_fld_elem_typbyval[col];
+	typalign = function->result_fld_elem_typalign[col];
 
 	/*
 	 * Special case for pass-by-value data types, if the following conditions are met:
@@ -1821,7 +1980,7 @@ get_generic_array_datum(SEXP rval, plr_function *function, int col, bool *isnull
 				else
 				{
 					nulls[i] = FALSE;
-					dvalues[i] = DirectFunctionCall1(float8_numeric, Float8GetDatum((double)REAL(rval)[i])); 
+					dvalues[i] = DirectFunctionCall1(float8_numeric, Float8GetDatum((double)REAL(rval)[i]));
 				}
 			}
 		}
@@ -1886,17 +2045,13 @@ static Tuplestorestate *
 get_frame_tuplestore(SEXP rval,
 					 plr_function *function,
 					 AttInMetadata *attinmeta,
-					 MemoryContext per_query_ctx,
-					 bool retset)
+					 MemoryContext per_query_ctx)
 {
 	Tuplestorestate	   *tupstore;
 	char			  **values;
 	HeapTuple			tuple;
 	TupleDesc			tupdesc = attinmeta->tupdesc;
 	int					tupdesc_nc = tupdesc->natts;
-#if GP_VERSION_NUM < 70000
-	Form_pg_attribute  *attrs = tupdesc->attrs;
-#endif
 	MemoryContext		oldcontext;
 	int					i, j;
 	int					nr = 0;
@@ -1923,18 +2078,13 @@ get_frame_tuplestore(SEXP rval,
 	 * If we return a set, get number of rows by examining the first column.
 	 * Otherwise, stop at one row.
 	 */
-	if (retset)
+	if (IS_DATAFRAME(rval))
 	{
-		if (isFrame(rval))
-		{
-			PROTECT(dfcol = VECTOR_ELT(rval, 0));
-			nr = length(dfcol);
-			UNPROTECT(1);
-		}
-		else if (isList(rval) || isNewList(rval))
-			nr = 1;
+		PROTECT(dfcol = VECTOR_ELT(rval, 0));
+		nr = length(dfcol);
+		UNPROTECT(1);
 	}
-	else
+	else if (isList(rval) || isNewList(rval))
 		nr = 1;
 
 	/* coerce columns to character in advance */
@@ -1943,11 +2093,7 @@ get_frame_tuplestore(SEXP rval,
 	{
 		PROTECT(dfcol = VECTOR_ELT(rval, j));
 		if((!isFactor(dfcol)) &&
-#if GP_VERSION_NUM >= 70000
-		   ((TupleDescAttr(tupdesc, j)->attndims == 0) ||
-#else
-		   ((attrs[j]->attndims == 0) ||
-#endif
+		   ((TUPLE_DESC_ATTR(tupdesc,j)->attndims == 0) ||
 			(TYPEOF(dfcol) != VECSXP)))
 		{
 			SEXP	obj;
@@ -1956,14 +2102,11 @@ get_frame_tuplestore(SEXP rval,
 			SET_VECTOR_ELT(result, j, obj);
 			UNPROTECT(1);
 		}
-#if GP_VERSION_NUM >= 70000
-		else if(TupleDescAttr(tupdesc, j)->attndims != 0)	/* array data type */
-#else
-		else if(attrs[j]->attndims != 0)	/* array data type */
-#endif
+		else if (TUPLE_DESC_ATTR(tupdesc,j)->attndims != 0)	/* array data type */
 		{
 			SEXP	obj;
 
+			/* a list column: coerce each per-row cell separately */
 			PROTECT(obj = NEW_LIST(nr));
 			for(i = 0; i < nr; i++)
 			{
@@ -1983,7 +2126,7 @@ get_frame_tuplestore(SEXP rval,
 		{
 			SEXP 	t;
 
-			for (t = ATTRIB(dfcol); t != R_NilValue; t = CDR(t))
+			for (t = dfcol; ANY_ATTRIB(t); t = CDR(t))
 			{
 				if(TAG(t) == R_LevelsSymbol)
 				{
@@ -2016,7 +2159,7 @@ get_frame_tuplestore(SEXP rval,
 				 */
 				if (INTEGER_ELT(dfcol, i) != NA_INTEGER)
 				{
-					for (t = ATTRIB(dfcol); t != R_NilValue; t = CDR(t))
+					for (t = dfcol; ANY_ATTRIB(t); t = CDR(t))
 					{
 						if(TAG(t) == R_LevelsSymbol)
 						{
@@ -2034,84 +2177,25 @@ get_frame_tuplestore(SEXP rval,
 				else
 					values[j] = NULL;
 			}
-			else
+			else if (TUPLE_DESC_ATTR(tupdesc,j)->attndims != 0)	/* array data type */
 			{
-#if GP_VERSION_NUM >= 70000
-				if ((TupleDescAttr(tupdesc, j)->attndims != 0) || (STRING_ELT(dfcol, i) != NA_STRING))
-#else
-				if ((attrs[j]->attndims != 0) || (STRING_ELT(dfcol, i) != NA_STRING))
-#endif
-				{
-#if GP_VERSION_NUM >= 70000
-					if (TupleDescAttr(tupdesc, j)->attndims == 0)
-#else
-					if (attrs[j]->attndims == 0)
-#endif
-					{
-						values[j] = pstrdup(CHAR(STRING_ELT(dfcol, i)));
-					}
-					else	/* array data type */
-					{
-						bool	isnull = false;
-						Datum	arr_datum;
+				bool	isnull = false;
+				Datum	arr_datum;
 
-						if (TYPEOF(dfcol) != VECSXP)
-							arr_datum = get_array_datum(dfcol, function, j, &isnull);
-						else
-							arr_datum = get_array_datum(VECTOR_ELT(dfcol,i), function, j, &isnull);
-
-						if (isnull)
-						{
-							values[j] = NULL;
-						}
-						else
-						{
-#if GP_VERSION_NUM >= 70000
-							LOCAL_FCINFO(fake_fcinfo, 1);
-#else
-							FunctionCallInfoData	fake_fcinfo;
-#endif
-							FmgrInfo				flinfo;
-							Datum					dvalue;
-#if GP_VERSION_NUM >= 70000
-							MemSet(fake_fcinfo, 0, SizeForFunctionCallInfo(1));
-							MemSet(&flinfo, 0, sizeof(flinfo));
-							fake_fcinfo->flinfo = &flinfo;
-							flinfo.fn_mcxt = CurrentMemoryContext;
-							fake_fcinfo->context = NULL;
-							fake_fcinfo->resultinfo = NULL;
-							fake_fcinfo->isnull = false;
-							fake_fcinfo->nargs = 1;
-							fake_fcinfo->args[0].value = arr_datum;
-							fake_fcinfo->args[0].isnull= false;
-							dvalue = array_out(fake_fcinfo);
-							if (fake_fcinfo->isnull)
-								values[j] = NULL;
-							else
-								values[j] = DatumGetCString(dvalue);
-#else
-							MemSet(&fake_fcinfo, 0, sizeof(fake_fcinfo));
-							MemSet(&flinfo, 0, sizeof(flinfo));
-							fake_fcinfo.flinfo = &flinfo;
-							flinfo.fn_mcxt = CurrentMemoryContext;
-							fake_fcinfo.context = NULL;
-							fake_fcinfo.resultinfo = NULL;
-							fake_fcinfo.isnull = false;
-							fake_fcinfo.nargs = 1;
-							fake_fcinfo.arg[0] = arr_datum;
-							fake_fcinfo.argnull[0] = false;
-							dvalue = (*array_out)(&fake_fcinfo);
-							if (fake_fcinfo.isnull)
-								values[j] = NULL;
-							else
-								values[j] = DatumGetCString(dvalue);
-#endif
-						}
-					}
-				}
+				if (TYPEOF(dfcol) != VECSXP)
+					arr_datum = get_array_datum(dfcol, function, j, &isnull);
 				else
+					arr_datum = get_array_datum(VECTOR_ELT(dfcol, i), function, j, &isnull);
+
+				if (isnull)
 					values[j] = NULL;
+				else
+					values[j] = OidOutputFunctionCall(F_ARRAY_OUT, arr_datum);
 			}
+			else if (STRING_ELT(dfcol, i) != NA_STRING)
+				values[j] = pstrdup(CHAR(STRING_ELT(dfcol, i)));
+			else
+				values[j] = NULL;
 
 			UNPROTECT(1);
 		}
@@ -2134,6 +2218,9 @@ get_frame_tuplestore(SEXP rval,
 	}
 	UNPROTECT(1);
 
+	oldcontext = MemoryContextSwitchTo(per_query_ctx);
+	MemoryContextSwitchTo(oldcontext);
+
 	return tupstore;
 }
 
@@ -2141,8 +2228,7 @@ static Tuplestorestate *
 get_matrix_tuplestore(SEXP rval,
 					 plr_function *function,
 					 AttInMetadata *attinmeta,
-					 MemoryContext per_query_ctx,
-					 bool retset)
+					 MemoryContext per_query_ctx)
 {
 	Tuplestorestate	   *tupstore;
 	char			  **values;
@@ -2160,10 +2246,7 @@ get_matrix_tuplestore(SEXP rval,
 	 * If we return a set, get number of rows.
 	 * Otherwise, stop at one row.
 	 */
-	if (retset)
-		nr = nrows(rval);
-	else
-		nr = 1;
+	nr = nrows(rval);
 
 	/* initialize our tuplestore */
 	tupstore = TUPLESTORE_BEGIN_HEAP;
@@ -2197,6 +2280,9 @@ get_matrix_tuplestore(SEXP rval,
 	}
 	UNPROTECT(1);
 
+	oldcontext = MemoryContextSwitchTo(per_query_ctx);
+	MemoryContextSwitchTo(oldcontext);
+
 	return tupstore;
 }
 
@@ -2204,8 +2290,7 @@ static Tuplestorestate *
 get_generic_tuplestore(SEXP rval,
 					 plr_function *function,
 					 AttInMetadata *attinmeta,
-					 MemoryContext per_query_ctx,
-					 bool retset)
+					 MemoryContext per_query_ctx)
 {
 	Tuplestorestate	   *tupstore;
 	char			  **values;
@@ -2223,10 +2308,7 @@ get_generic_tuplestore(SEXP rval,
 	 * If we return a set, get number of rows.
 	 * Otherwise, stop at one row.
 	 */
-	if (retset)
-		nr = length(rval);
-	else
-		nr = 1;
+	nr = length(rval);
 
 	/* initialize our tuplestore */
 	tupstore = TUPLESTORE_BEGIN_HEAP;
@@ -2256,6 +2338,9 @@ get_generic_tuplestore(SEXP rval,
 		MemoryContextSwitchTo(oldcontext);
 	}
 	UNPROTECT(1);
+
+	oldcontext = MemoryContextSwitchTo(per_query_ctx);
+	MemoryContextSwitchTo(oldcontext);
 
 	return tupstore;
 }
