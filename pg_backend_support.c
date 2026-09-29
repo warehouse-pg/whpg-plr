@@ -2,7 +2,7 @@
  * PL/R - PostgreSQL support for R as a
  *	      procedural language (PL)
  *
- * Copyright (c) 2003-2015 by Joseph E. Conway
+ * Copyright (c) 2003 by Joseph E. Conway
  * ALL RIGHTS RESERVED
  * 
  * Joe Conway <mail@joeconway.com>
@@ -49,7 +49,7 @@ extern MemoryContext plr_caller_context;
 /*
  * static declarations
  */
-static char *get_lib_pathstr(Oid funcid);
+static char *get_lib_pathstr(Oid langOid);
 static char *expand_dynamic_library_name(const char *name);
 static char *substitute_libpath_macro(const char *name);
 static char *find_in_dynamic_libpath(const char *basename);
@@ -117,11 +117,21 @@ plr_HashTableInit(void)
 	memset(&ctl, 0, sizeof(ctl));
 	ctl.keysize = sizeof(plr_func_hashkey);
 	ctl.entrysize = sizeof(plr_HashEnt);
+
+// specifying the hash function has been deprecated since 12
+#if (PG_VERSION_NUM < 120000)
 	ctl.hash = tag_hash;
+
 	plr_HashTable = hash_create("PLR function cache",
 								FUNCS_PER_USER,
 								&ctl,
 								HASH_ELEM | HASH_FUNCTION);
+#else
+	plr_HashTable = hash_create("PLR function cache",
+								FUNCS_PER_USER,
+								&ctl,
+								HASH_ELEM | HASH_BLOBS);
+#endif
 }
 
 plr_function *
@@ -176,11 +186,9 @@ plr_HashTableDelete(plr_function *function)
 }
 
 static char *
-get_lib_pathstr(Oid funcid)
+get_lib_pathstr(Oid langOid)
 {
 	HeapTuple			procedureTuple;
-	Form_pg_proc		procedureStruct;
-	Oid					language;
 	HeapTuple			languageTuple;
 	Form_pg_language	languageStruct;
 	Oid					lang_funcid;
@@ -189,25 +197,12 @@ get_lib_pathstr(Oid funcid)
 	char			   *raw_path;
 	char			   *cooked_path;
 
-	/* get the pg_proc entry */
-	procedureTuple = SearchSysCache(PROCOID,
-									ObjectIdGetDatum(funcid),
-									0, 0, 0);
-	if (!HeapTupleIsValid(procedureTuple))
-		/* internal error */
-		elog(ERROR, "cache lookup failed for function %u", funcid);
-	procedureStruct = (Form_pg_proc) GETSTRUCT(procedureTuple);
-
-	/* now get the pg_language entry */
-	language = procedureStruct->prolang;
-	ReleaseSysCache(procedureTuple);
-
 	languageTuple = SearchSysCache(LANGOID,
-								   ObjectIdGetDatum(language),
+								   ObjectIdGetDatum(langOid),
 								   0, 0, 0);
 	if (!HeapTupleIsValid(languageTuple))
 		/* internal error */
-		elog(ERROR, "cache lookup failed for language %u", language);
+		elog(ERROR, "cache lookup failed for language %u", langOid);
 	languageStruct = (Form_pg_language) GETSTRUCT(languageTuple);
 	lang_funcid = languageStruct->lanplcallfoid;
 	ReleaseSysCache(languageTuple);
@@ -219,7 +214,6 @@ get_lib_pathstr(Oid funcid)
 	if (!HeapTupleIsValid(procedureTuple))
 		/* internal error */
 		elog(ERROR, "cache lookup failed for function %u", lang_funcid);
-	procedureStruct = (Form_pg_proc) GETSTRUCT(procedureTuple);
 
 	tmp = SysCacheGetAttr(PROCOID, procedureTuple, Anum_pg_proc_probin, &isnull);
 	raw_path = DatumGetCString(DirectFunctionCall1(byteaout, tmp));
@@ -231,8 +225,8 @@ get_lib_pathstr(Oid funcid)
 		char   *result;
 		int		bc;
 		size_t	len = strlen(raw_path);
-
 		bc = (len - 2)/2 + 1;            /* maximum possible length */
+
 		result = palloc0(bc);
 
 		bc = hex_decode(raw_path + 2, len - 2, result);
@@ -253,9 +247,9 @@ get_lib_pathstr(Oid funcid)
 }
 
 char *
-get_load_self_ref_cmd(Oid funcid)
+get_load_self_ref_cmd(Oid langOid)
 {
-	char   *libstr = get_lib_pathstr(funcid);
+	char   *libstr = get_lib_pathstr(langOid);
 	char   *buf = NULL;
 
 	if (libstr)
@@ -280,7 +274,7 @@ file_exists(const char *name)
 {
 	struct stat st;
 
-	AssertArg(name != NULL);
+	Assert(name != NULL);
 
 	if (stat(name, &st) == 0)
 		return S_ISDIR(st.st_mode) ? false : true;
@@ -312,10 +306,11 @@ expand_dynamic_library_name(const char *name)
 	char	   *new;
 	char	   *full;
 
-	AssertArg(name);
+	Assert(name);
 
 	have_slash = (strchr(name, '/') != NULL);
 
+#ifndef WIN32
 	if (!have_slash)
 	{
 		full = find_in_dynamic_libpath(name);
@@ -329,6 +324,7 @@ expand_dynamic_library_name(const char *name)
 			return full;
 		pfree(full);
 	}
+#endif
 
 	new = palloc(strlen(name) + strlen(DLSUFFIX) + 1);
 	strcpy(new, name);
@@ -364,7 +360,7 @@ substitute_libpath_macro(const char *name)
 	char	   *ret;
 	char		pkglib_path[MAXPGPATH];
 
-	AssertArg(name != NULL);
+	Assert(name != NULL);
 	get_pkglib_path(my_exec_path, pkglib_path);
 
 	if (name[0] != '$')
@@ -400,13 +396,13 @@ find_in_dynamic_libpath(const char *basename)
 	size_t		baselen;
 	char	   *Dynamic_library_path = GetConfigOptionByName("dynamic_library_path", NULL
 #if PG_VERSION_NUM >= 90600
-                      , false
+								 , false
 #endif
-					);
+		);
 
-	AssertArg(basename != NULL);
-	AssertArg(strchr(basename, '/') == NULL);
-	AssertState(Dynamic_library_path != NULL);
+	Assert(basename != NULL);
+	Assert(strchr(basename, '/') == NULL);
+	Assert(Dynamic_library_path != NULL);
 
 	p = Dynamic_library_path;
 	if (strlen(p) == 0)

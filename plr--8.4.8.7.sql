@@ -1,10 +1,19 @@
--- keep this in sync with the plr.sql.in legacy install file
-
 CREATE FUNCTION plr_call_handler()
 RETURNS LANGUAGE_HANDLER
 AS 'MODULE_PATHNAME' LANGUAGE C;
 
-CREATE LANGUAGE plr HANDLER plr_call_handler;
+CREATE FUNCTION plr_inline_handler(internal)
+RETURNS VOID
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION plr_validator(oid)
+RETURNS VOID
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE LANGUAGE plr
+HANDLER plr_call_handler
+INLINE plr_inline_handler
+VALIDATOR plr_validator;
 
 CREATE OR REPLACE FUNCTION plr_version ()
 RETURNS text
@@ -48,10 +57,13 @@ REVOKE EXECUTE ON FUNCTION plr_environ() FROM PUBLIC;
 CREATE TYPE r_typename AS (typename text, typeoid oid);
 CREATE OR REPLACE FUNCTION r_typenames()
 RETURNS SETOF r_typename AS '
-  x <- ls(name = .GlobalEnv, pat = "OID")
-  y <- vector()
-  for (i in 1:length(x)) {y[i] <- eval(parse(text = x[i]))}
-  data.frame(typename = x, typeoid = y)
+  within(data.frame(
+    typename = ls(name = .GlobalEnv, pat = "OID"),
+    stringsAsFactors = FALSE
+  ),
+  {
+    typeoid <- sapply(typename, get)
+  })
 ' language 'plr';
 
 CREATE OR REPLACE FUNCTION load_r_typenames()
@@ -96,5 +108,5 @@ REVOKE EXECUTE ON FUNCTION plr_set_display (text) FROM PUBLIC;
 CREATE OR REPLACE FUNCTION plr_get_raw (bytea)
 RETURNS bytea
 AS 'MODULE_PATHNAME','plr_get_raw'
-LANGUAGE C STRICT;
+LANGUAGE C STRICT; 
 

@@ -1,8 +1,8 @@
 # location of R library
 
 ifdef R_HOME
-r_libdir1x = ${R_HOME}/bin
-r_libdir2x = ${R_HOME}/lib
+r_libdir1x = ${R_HOME}/bin${R_ARCH}
+r_libdir2x = ${R_HOME}/lib${R_ARCH}
 # location of R includes
 r_includespec = -I${R_HOME}/include
 rhomedef = ${R_HOME}
@@ -22,10 +22,18 @@ PG_CPPFLAGS	+= $(r_includespec)
 SRCS		+= plr.c pg_conversion.c pg_backend_support.c pg_userfuncs.c pg_rsupport.c
 OBJS		:= $(SRCS:.c=.o)
 SHLIB_LINK	+= -L$(r_libdir1x) -L$(r_libdir2x) -lR
-DATA_built	= plr.sql
-DATA		= plr--8.3.0.16.sql plr--unpackaged--8.3.0.16.sql
-DOCS		= README.plr
-REGRESS		= plr bad_fun
+DATA		= plr--8.4.8.7.sql plr--unpackaged--8.4.8.7.sql \
+plr--8.3.0.16--8.3.0.18.sql plr--8.3.0.18--8.4.sql plr--8.4--8.4.1.sql plr--8.4.1--8.4.2.sql \
+plr--8.4.2--8.4.3.sql plr--8.4.3--8.4.4.sql plr--8.4.4--8.4.5.sql plr--8.4.5--8.4.6.sql \
+plr--8.4.6--8.4.7.sql plr--8.4.7--8.4.8.sql plr--8.4.8--8.4.8.1.sql plr--8.4.8.1--8.4.8.2.sql \
+plr--8.4.8.2--8.4.8.3.sql plr--8.4.8.3--8.4.8.4.sql plr--8.4.8.4--8.4.8.5.sql \
+plr--8.4.8.5--8.4.8.6.sql plr--8.4.8.6--8.4.8.7.sql
+# Upstream dropped DOCS entirely and replaced README.plr with README.md.
+# Keep a DOCS entry pointing at the new file: rpm/plr.spec ships
+# %{prefix}/greenplum-db/share/doc, so leaving DOCS empty risks an empty path
+# and a %files failure.
+DOCS		= README.md
+REGRESS		= plr bad_fun opt_window do out_args plr_transaction opt_window_frame parallel
 EXTRA_CLEAN	= doc/html/* doc/plr-US.aux doc/plr-*.log doc/plr-*.out doc/plr-*.pdf doc/plr-*.tex-pdf
 
 ifdef USE_PGXS
