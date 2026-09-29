@@ -1348,6 +1348,13 @@ do_compile(FunctionCallInfo fcinfo,
 		}
 		ReleaseSysCache(typeTup);
 
+		/* done with the result tupdesc handed out by get_call_result_type() */
+		if (TYPEFUNC_COMPOSITE == tfc)
+		{
+			ReleaseTupleDesc(tupdesc);
+			tupdesc = NULL;
+		}
+
 		/*
 		 * Get the required information for output conversion
 		 * of all procedure arguments
@@ -1416,7 +1423,7 @@ do_compile(FunctionCallInfo fcinfo,
 			if (argnames && argnames[j] && argnames[j][0])
 			{
 				appendStringInfo(proc_internal_args, "%s", argnames[j]);
-				pfree(argnames[i]);
+				pfree(argnames[j]);
 			}
 			else
 				appendStringInfo(proc_internal_args, "arg%d", i + 1);

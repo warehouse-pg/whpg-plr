@@ -33,6 +33,7 @@
  *                   to pg types
  */
 #include "plr.h"
+#include "utils/fmgroids.h"
 
 static void pg_get_one_r(char *value, Oid arg_out_fn_oid, SEXP obj,
 																int elnum);
@@ -62,7 +63,7 @@ static Tuplestorestate *get_generic_tuplestore(SEXP rval,
 											 AttInMetadata *attinmeta,
 											 MemoryContext per_query_ctx);
 static SEXP coerce_to_char(SEXP rval);
-static Datum r_get_tuple(SEXP rval, plr_function *function, FunctionCallInfo fcinfo);
+static Datum r_get_tuple(SEXP rval, plr_function *function, FunctionCallInfo fcinfo, bool *isnull);
 
 extern char *last_R_error_msg;
 
@@ -357,6 +358,13 @@ pg_window_frame_get_r(WindowObject winobj, int argno, plr_function* function)
 	char		typdelim, typalign;
 	Oid			typoutput, typioparam;
 	FmgrInfo	outputproc;
+	/* per-column type info for tuple arguments, looked up once on the first row */
+	Oid		   *col_typid = NULL;
+	Oid		   *col_typelem = NULL;
+	int16	   *col_typlen = NULL;
+	bool	   *col_typbyval = NULL;
+	char	   *col_typalign = NULL;
+	FmgrInfo   *col_outputproc = NULL;
 
 	int64		num_partition_rows = WinGetPartitionRowCount(winobj);
 	if (num_partition_rows < 1)
@@ -403,6 +411,13 @@ pg_window_frame_get_r(WindowObject winobj, int argno, plr_function* function)
 		 * If !isrel, then nc == nc_effective == 1, see below
 		 */
 		PROTECT(names = NEW_CHARACTER(nc_effective));
+
+		col_typid = palloc(nc * sizeof(Oid));
+		col_typelem = palloc(nc * sizeof(Oid));
+		col_typlen = palloc(nc * sizeof(int16));
+		col_typbyval = palloc(nc * sizeof(bool));
+		col_typalign = palloc(nc * sizeof(char));
+		col_outputproc = palloc(nc * sizeof(FmgrInfo));
 	}
 	PROTECT(result = NEW_LIST(nc_effective));
 
@@ -444,13 +459,31 @@ pg_window_frame_get_r(WindowObject winobj, int argno, plr_function* function)
 				if (num_frame_row == 0)
 					SET_COLUMN_NAMES;
 
-				/* update column datatype oid and check for embedded array */
-				element_type = SPI_gettypeid(tupdesc, j + 1);
-				typelem = get_element_type(element_type);
+				/*
+				 * Update column datatype oid and check for embedded array.
+				 * The catalog lookups only happen on the first frame row;
+				 * later rows reuse the cached per-column info.
+				 */
+				if (num_frame_row == 0)
+				{
+					col_typid[j] = SPI_gettypeid(tupdesc, j + 1);
+					col_typelem[j] = get_element_type(col_typid[j]);
+					if (col_typelem[j] != InvalidOid)
+					{
+						get_type_io_data(col_typelem[j], IOFunc_output,
+										 col_typlen + j, col_typbyval + j, col_typalign + j,
+										 &typdelim, &typioparam, &typoutput);
+						fmgr_info(typoutput, col_outputproc + j);
+					}
+				}
+				element_type = col_typid[j];
+				typelem = col_typelem[j];
 				if (typelem != InvalidOid)
 				{
-					get_type_io_data(typelem, IOFunc_output, &typlen, &typbyval, &typalign, &typdelim, &typioparam, &typoutput);
-					fmgr_info(typoutput, &outputproc);
+					typlen = col_typlen[j];
+					typbyval = col_typbyval[j];
+					typalign = col_typalign[j];
+					outputproc = col_outputproc[j];
 				}
 			}
 
@@ -817,7 +850,7 @@ r_get_pg(SEXP rval, plr_function *function, FunctionCallInfo fcinfo)
 	else if (fcinfo->flinfo->fn_retset)
 		result = get_tuplestore(rval, function, fcinfo, &isnull);
 	else if (function->result_natts > 1)
-		result = r_get_tuple(rval, function, fcinfo);
+		result = r_get_tuple(rval, function, fcinfo, &isnull);
 	else
 	{
 		/* short circuit if return value is Null */
@@ -847,14 +880,21 @@ r_get_pg(SEXP rval, plr_function *function, FunctionCallInfo fcinfo)
  * This is used to return a single RECORD (not SETOF)
  */
 Datum
-r_get_tuple(SEXP rval, plr_function *function, FunctionCallInfo fcinfo)
+r_get_tuple(SEXP rval, plr_function *function, FunctionCallInfo fcinfo, bool *isnull)
 {
 	Oid			oid;
 	TupleDesc	tupdesc;
 	HeapTuple	tuple;
 	Datum	   *values;
-	bool	   *isnull;
+	bool	   *nulls;
 	int			i, min_length;
+
+	/* short circuit if return value is Null */
+	if (rval == R_NilValue || isNull(rval))
+	{
+		*isnull = true;
+		return (Datum) 0;
+	}
 
 	if (!(IS_DATAFRAME(rval) || isNewList(rval) || isList(rval)))
 		elog(ERROR, "Only list alike is expected");
@@ -864,26 +904,29 @@ r_get_tuple(SEXP rval, plr_function *function, FunctionCallInfo fcinfo)
 
 	min_length = Min(function->result_natts, length(rval));
 
-	//if (tupdesc->natts != length(rval))
-	//	elog(ERROR, "same length expected");
-
 	BlessTupleDesc(tupdesc);
 
 	values = palloc0(sizeof(Datum) * tupdesc->natts);
-	isnull = palloc0(sizeof(bool) * tupdesc->natts);
+	nulls = palloc0(sizeof(bool) * tupdesc->natts);
 
 	for (i = 0; i < min_length; i++)
 	{
 		SEXP el = VECTOR_ELT(rval, i);
 		if (function->result_fld_typid[i] != function->result_fld_elem_typid[i])
-			values[i] = get_array_datum(el, function, i, isnull + i);
+			values[i] = get_array_datum(el, function, i, nulls + i);
 		else
-			values[i] = get_scalar_datum(el, function->result_fld_elem_typid[i], function->result_fld_elem_in_func[i], isnull + i);
+			values[i] = get_scalar_datum(el, function->result_fld_elem_typid[i], function->result_fld_elem_in_func[i], nulls + i);
 	}
 
-	tuple = heap_form_tuple(tupdesc, values, isnull);
+	/* an R list shorter than the row type leaves the trailing columns NULL */
+	for (; i < tupdesc->natts; i++)
+		nulls[i] = true;
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
 	pfree(values);
-	pfree(isnull);
+	pfree(nulls);
+	ReleaseTupleDesc(tupdesc);
+	*isnull = false;
 	return HeapTupleGetDatum(tuple);
 }
 
@@ -2059,6 +2102,26 @@ get_frame_tuplestore(SEXP rval,
 			SET_VECTOR_ELT(result, j, obj);
 			UNPROTECT(1);
 		}
+		else if (TUPLE_DESC_ATTR(tupdesc,j)->attndims != 0)	/* array data type */
+		{
+			SEXP	obj;
+
+			/* a list column: coerce each per-row cell separately */
+			PROTECT(obj = NEW_LIST(nr));
+			for(i = 0; i < nr; i++)
+			{
+				SEXP	dfcolcell;
+				SEXP	objcell;
+
+				PROTECT(dfcolcell = VECTOR_ELT(dfcol, i));
+				PROTECT(objcell = coerce_to_char(dfcolcell));
+				SET_VECTOR_ELT(obj, i, objcell);
+				UNPROTECT(2);
+			}
+
+			SET_VECTOR_ELT(result, j, obj);
+			UNPROTECT(1);
+		}
 		else
 		{
 			SEXP 	t;
@@ -2113,6 +2176,21 @@ get_frame_tuplestore(SEXP rval,
 				}
 				else
 					values[j] = NULL;
+			}
+			else if (TUPLE_DESC_ATTR(tupdesc,j)->attndims != 0)	/* array data type */
+			{
+				bool	isnull = false;
+				Datum	arr_datum;
+
+				if (TYPEOF(dfcol) != VECSXP)
+					arr_datum = get_array_datum(dfcol, function, j, &isnull);
+				else
+					arr_datum = get_array_datum(VECTOR_ELT(dfcol, i), function, j, &isnull);
+
+				if (isnull)
+					values[j] = NULL;
+				else
+					values[j] = OidOutputFunctionCall(F_ARRAY_OUT, arr_datum);
 			}
 			else if (STRING_ELT(dfcol, i) != NA_STRING)
 				values[j] = pstrdup(CHAR(STRING_ELT(dfcol, i)));
