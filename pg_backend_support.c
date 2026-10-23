@@ -326,9 +326,7 @@ expand_dynamic_library_name(const char *name)
 	}
 #endif
 
-	new = palloc(strlen(name) + strlen(DLSUFFIX) + 1);
-	strcpy(new, name);
-	strcat(new, DLSUFFIX);
+	new = psprintf("%s%s", name, DLSUFFIX);
 
 	if (!have_slash)
 	{
@@ -357,7 +355,6 @@ static char *
 substitute_libpath_macro(const char *name)
 {
 	const char *sep_ptr;
-	char	   *ret;
 	char		pkglib_path[MAXPGPATH];
 
 	Assert(name != NULL);
@@ -375,12 +372,7 @@ substitute_libpath_macro(const char *name)
 				(errcode(ERRCODE_INVALID_NAME),
 				errmsg("invalid macro name in dynamic library path: %s", name)));
 
-	ret = palloc(strlen(pkglib_path) + strlen(sep_ptr) + 1);
-
-	strcpy(ret, pkglib_path);
-	strcat(ret, sep_ptr);
-
-	return ret;
+	return psprintf("%s%s", pkglib_path, sep_ptr);
 }
 
 /*
@@ -425,8 +417,7 @@ find_in_dynamic_libpath(const char *basename)
 					 errmsg("zero-length component in DYNAMIC_LIBRARY_PATH")));
 
 		piece = palloc(len + 1);
-		strncpy(piece, p, len);
-		piece[len] = '\0';
+		strlcpy(piece, p, len + 1);
 
 		mangled = substitute_libpath_macro(piece);
 		pfree(piece);

@@ -1214,7 +1214,9 @@ permission revoked from PUBLIC.
 By default, when R objects are returned as type `bytea`, the R object is serialized using an internal
 R function prior to sending to PostgreSQL. This function deserializes the R object using another
 internal R function, and returns the pure raw bytes to PostgreSQL. This is useful, for example, if the
-R object being returned is a JPEG or PNG graphic for use outside of R.
+R object being returned is a JPEG or PNG graphic for use outside of R. This function is installed
+with EXECUTE permission revoked from PUBLIC, because it passes its input to R's `unserialize()`.
+Do not grant it to untrusted users.
 
 
 ## Aggregate Functions<a name='aggregate-functions'></a>

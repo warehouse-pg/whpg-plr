@@ -673,8 +673,8 @@ PGDLLEXPORT SEXP plr_SPI_prepare(SEXP rsql, SEXP rargtypes);
 PGDLLEXPORT SEXP plr_SPI_execp(SEXP rsaved_plan, SEXP rargvalues);
 PGDLLEXPORT SEXP plr_SPI_cursor_open(SEXP cursor_name_arg,SEXP rsaved_plan, SEXP rargvalues);
 PGDLLEXPORT SEXP plr_SPI_cursor_fetch(SEXP cursor_in,SEXP forward_in, SEXP rows_in);
-PGDLLEXPORT void plr_SPI_cursor_close(SEXP cursor_in);
-PGDLLEXPORT void plr_SPI_cursor_move(SEXP cursor_in, SEXP forward_in, SEXP rows_in);
+PGDLLEXPORT SEXP plr_SPI_cursor_close(SEXP cursor_in);
+PGDLLEXPORT SEXP plr_SPI_cursor_move(SEXP cursor_in, SEXP forward_in, SEXP rows_in);
 PGDLLEXPORT SEXP plr_SPI_lastoid(void);
 PGDLLEXPORT void throw_r_error(const char **msg);
 #if PG_VERSION_NUM >= 110000
