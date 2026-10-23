@@ -34,6 +34,20 @@ for details.
 * Push your local branch to the fork (e.g. `git push <your_fork>
   my_feature_branch`)
 
+## Syncing with upstream PL/R
+
+The `whpg` branch carries upstream PL/R content without upstream's git
+history, so a sync can silently bring back files this fork removes.
+Upstream's AppVeyor and Travis CI files are not used here and must be
+removed again after every sync:
+
+```
+git rm -q --ignore-unmatch appveyor.yml .travis.yml build_script.sh \
+    after_build.sh test_script.sh init.sh pggithubbincachefailingfound.sh \
+    buildsetup.pl clean_pgsql_sln.sh msvc.diff.R Solution.pm.R \
+    server_version_num.sh
+```
+
 ## Submitting a Pull Request
 
 * Create a [pull request from your
