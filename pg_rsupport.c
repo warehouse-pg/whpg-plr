@@ -686,7 +686,7 @@ plr_SPI_cursor_open(SEXP cursor_name_arg,SEXP rsaved_plan, SEXP rargvalues)
 
 		UNPROTECT(1);
 	}
-	strncpy(cursor_name, CHAR(STRING_ELT(cursor_name_arg,0)), 64);
+	strlcpy(cursor_name, CHAR(STRING_ELT(cursor_name_arg,0)), sizeof(cursor_name));
 
 	/* switch to SPI memory context */
 	SWITCHTO_PLR_SPI_CONTEXT(oldcontext);
@@ -769,7 +769,7 @@ plr_SPI_cursor_fetch(SEXP cursor_in,SEXP forward_in, SEXP rows_in)
 	return result;
 }
 
-void
+SEXP
 plr_SPI_cursor_close(SEXP cursor_in)
 {
 	Portal				portal=NULL;
@@ -790,9 +790,12 @@ plr_SPI_cursor_close(SEXP cursor_in)
 	PLR_PG_END_TRY();
 	/* back to caller's memory context */
 	MemoryContextSwitchTo(oldcontext);
+
+	POP_PLERRCONTEXT;
+	return R_NilValue;
 }
 
-void
+SEXP
 plr_SPI_cursor_move(SEXP cursor_in,SEXP forward_in, SEXP rows_in)
 {
 	Portal				portal=NULL;
@@ -806,12 +809,12 @@ plr_SPI_cursor_move(SEXP cursor_in,SEXP forward_in, SEXP rows_in)
 	if(!IS_LOGICAL(forward_in))
 	{
 		error("pg.spi.cursor_move arg2 must be boolean");
-		return;
+		return R_NilValue;
 	}
 	if(!IS_INTEGER(rows_in))
 	{
 		error("pg.spi.cursor_move arg3 must be an integer");
-		return;
+		return R_NilValue;
 	}
 	forward = LOGICAL(forward_in)[0];
 	rows  = INTEGER(rows_in)[0];
@@ -828,6 +831,9 @@ plr_SPI_cursor_move(SEXP cursor_in,SEXP forward_in, SEXP rows_in)
 
 	/* back to caller's	 memory context */
 	MemoryContextSwitchTo(oldcontext);
+
+	POP_PLERRCONTEXT;
+	return R_NilValue;
 }
 
 void

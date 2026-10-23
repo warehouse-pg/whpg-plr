@@ -95,7 +95,7 @@ pg_scalar_get_r(Datum dvalue, Oid arg_typid, FmgrInfo arg_out_func)
 		SEXP 	s, t, obj;
 		int		status;
 		Datum	dt_dvalue =  PointerGetDatum(PG_DETOAST_DATUM(dvalue));
-		int		bsize = VARSIZE((bytea *) dt_dvalue);
+		int		bsize = VARSIZE((bytea *) dt_dvalue) - VARHDRSZ;
 
 		PROTECT(obj = get_r_vector(arg_typid, bsize));
 		memcpy((char *) RAW(obj),
