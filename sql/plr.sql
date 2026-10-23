@@ -558,3 +558,32 @@ LANGUAGE plr;
 SELECT test_create_procedure();
 
 SELECT * FROM tbl;
+
+-- Test that sensitive helper functions are not executable by PUBLIC
+SELECT proname, has_function_privilege('public', oid, 'EXECUTE') AS public_execute
+FROM pg_proc
+WHERE proname IN ('install_rcmd', 'plr_environ', 'plr_set_rhome',
+                  'plr_unset_rhome', 'plr_set_display', 'plr_get_raw')
+ORDER BY proname;
+
+-- Test cursors: a name longer than NAMEDATALEN - 1 is truncated
+CREATE OR REPLACE FUNCTION cursor_long_name_test() RETURNS SETOF integer AS 'plan<-pg.spi.prepare("SELECT * FROM generate_series(1,3)"); cursor<-pg.spi.cursor_open(strrep("c",70),plan); dat<-pg.spi.cursor_fetch(cursor,TRUE,as.integer(3)); len<-pg.spi.exec("SELECT length(name) FROM pg_cursors"); pg.spi.cursor_close(cursor); return (c(dat[[1]],len[[1]]));' language 'plr';
+SELECT * FROM cursor_long_name_test();
+
+-- Test cursors: moving, then fetching and closing
+CREATE OR REPLACE FUNCTION cursor_move_test() RETURNS SETOF integer AS 'plan<-pg.spi.prepare("SELECT * FROM generate_series(1,10)"); cursor<-pg.spi.cursor_open("curs",plan); pg.spi.cursor_move(cursor,TRUE,as.integer(2)); dat<-pg.spi.cursor_fetch(cursor,TRUE,as.integer(1)); pg.spi.cursor_close(cursor); return (dat);' language 'plr';
+SELECT * FROM cursor_move_test();
+
+-- Test plr_get_raw(): raw bytes of a serialized raw vector
+CREATE OR REPLACE FUNCTION test_raw_obj() RETURNS bytea AS 'as.raw(c(1,2,255))' language 'plr';
+CREATE OR REPLACE FUNCTION test_int_obj() RETURNS bytea AS '1:3' language 'plr';
+SELECT plr_get_raw(test_raw_obj());
+-- a serialized object that is not a raw vector is rejected
+SELECT plr_get_raw(test_int_obj());
+CREATE TABLE raw_obj AS SELECT test_raw_obj() AS b DISTRIBUTED RANDOMLY;
+-- plr_get_raw() as the first PL/R call of a session, on the coordinator
+\c -
+SELECT plr_get_raw((SELECT b FROM raw_obj));
+-- plr_get_raw() as the first PL/R call of a session, on a segment
+\c -
+SELECT plr_get_raw(b) FROM raw_obj;

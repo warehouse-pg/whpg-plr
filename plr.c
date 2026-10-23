@@ -442,29 +442,15 @@ load_r_cmd(const char *cmd)
 void
 PLR_CLEANUP
 {
-	char   *buf;
-	char   *tmpdir = getenv("R_SESSION_TMPDIR");
-
 	R_dot_Last();
 	R_RunExitFinalizers();
 	KillAllDevices();
 
-	if(tmpdir)
-	{
-		int		rv;
-		/*
-		 * length needed = 'rm -rf ""' == 9
-		 * plus 1 for NULL terminator
-		 * plus length of dir string
-		 */
-		buf = (char *) palloc(9 + 1 + strlen(tmpdir));
-		sprintf(buf, "rm -rf \"%s\"", tmpdir);
-
-		/* ignoring return value */
-		rv = system(buf);
-		if (rv != 0)
-			; /* do nothing */
-	}
+	/*
+	 * Remove the session temp dir. R tracks it internally, so a changed
+	 * R_SESSION_TMPDIR environment variable cannot redirect the removal.
+	 */
+	R_CleanTempDir();
 }
 
 static void

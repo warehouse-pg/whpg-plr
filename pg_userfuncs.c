@@ -524,8 +524,11 @@ plr_get_raw(PG_FUNCTION_ARGS)
 	bytea  *bresult;
 	char   *brptr;
 
-	PROTECT(obj = NEW_RAW(VARSIZE(bvalue)));
-	memcpy((char *) RAW(obj), VARDATA(bvalue), VARSIZE(bvalue));
+	/* Init if not already done; this may be the first PL/R call */
+	plr_init();
+
+	PROTECT(obj = NEW_RAW(VARSIZE(bvalue) - VARHDRSZ));
+	memcpy((char *) RAW(obj), VARDATA(bvalue), VARSIZE(bvalue) - VARHDRSZ);
 
 	/*
 	 * Need to construct a call to
@@ -548,6 +551,17 @@ plr_get_raw(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_DATA_EXCEPTION),
 					 errmsg("R interpreter expression evaluation error"),
 					 errdetail("R expression evaluation error caught in \"unserialize\".")));
+	}
+
+	if (TYPEOF(result) != RAWSXP)
+	{
+		const char *rtype = type2char(TYPEOF(result));
+
+		UNPROTECT(3);
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("unserialized R object is not a raw vector"),
+				 errdetail("R object type is \"%s\".", rtype)));
 	}
 
 	len = LENGTH(result);
