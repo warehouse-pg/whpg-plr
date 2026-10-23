@@ -23,3 +23,7 @@ ALTER EXTENSION plr ADD function plr_set_display (text);
 ALTER EXTENSION plr ADD function plr_get_raw (bytea);
 
 ALTER EXTENSION plr ADD LANGUAGE plr;
+
+-- plr_get_raw() feeds caller-supplied bytes to R's unserialize(), so it is
+-- restricted like the other sensitive PL/R helper functions.
+REVOKE EXECUTE ON FUNCTION plr_get_raw (bytea) FROM PUBLIC;
